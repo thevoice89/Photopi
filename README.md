@@ -18,10 +18,11 @@ A lightweight camera application for Raspberry Pi with HQ Camera module, featuri
 
 ## 🔧 Hardware Requirements
 
-- Raspberry Pi (Zero 2W or newer recommended)
-- Raspberry Pi HQ Camera Module
-- Display with touchscreen support and hdmi(any resolution)
-- Push button connected to GPIO 26 and GND
+- Raspberry Pi (Zero 2W or newer recommended):https://amzn.to/4kIDnxV
+- Raspberry Pi HQ Camera Module: https://amzn.to/3Of9oSp
+- Display with touchscreen support and hdmi(any resolution):https://it.aliexpress.com/item/1005006948147325.html?spm=a2g0o.order_list.order_list_main.21.72883696ciHuuQ&gatewayAdapt=glo2ita
+- Hdmi connector: https://it.aliexpress.com/item/1005008922900022.html?spm=a2g0o.order_list.order_list_main.15.72883696ciHuuQ&gatewayAdapt=glo2ita
+- Push button connected to GPIO 26 and GND: https://it.aliexpress.com/item/1005004784681487.html?spm=a2g0o.order_list.order_list_main.102.72883696ciHuuQ&gatewayAdapt=glo2ita
 - UPS-Lite V1.3 or compatible battery (optional)
 - Raspberry Pi OS Trixie Lite (or newer)
 
@@ -522,3 +523,9 @@ This project is provided "as-is" for personal use.
 ---
 
 **Happy photographing! 📸✨**
+
+
+DONATE
+If you’d like to support me and my work, please consider making a donation here:
+
+SATISPAY: https://web.satispay.com/download/qrcode/S6Y-SVN--D276047B-5BC4-45FD-AC89-D78E7579EC4A?locale=it
