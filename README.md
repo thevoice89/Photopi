@@ -2,6 +2,8 @@
 
 A lightweight camera application for Raspberry Pi with HQ Camera module, featuring touchscreen interface, WiFi hotspot capability, and remote web control.
 
+[![Look My video (You can put english with autotransaltion)](https://img.youtube.com/vi/JkhWkDddtTM/hqdefault.jpg)](https://youtu.be/JkhWkDddtTM)
+
 ## ✨ Features
 
 - 🎥 **Live Camera Preview** with hardware acceleration
