@@ -529,3 +529,4 @@ DONATE
 If you’d like to support me and my work, please consider making a donation here:
 
 SATISPAY: https://web.satispay.com/download/qrcode/S6Y-SVN--D276047B-5BC4-45FD-AC89-D78E7579EC4A?locale=it
+Paypal: https://www.paypal.com/pool/9mSjn8OiuS?sr=wccr
