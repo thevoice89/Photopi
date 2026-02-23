@@ -476,21 +476,12 @@ sudo reboot
 - Use a firewall to restrict port 8080 access
 - Disable autostart and run the camera app manually when needed
 
-## 📄 Project Structure
+## 📄 Case?
 
-```
-~/raspi/
-├── camera_app.py       # Main camera application
-├── photo_server.py     # Web server for photo gallery and remote control
-├── setup.sh            # Complete installation script
-├── assets/             # UI icons (downloaded during setup)
-│   ├── icon_gallery.png
-│   ├── icon_power.png
-│   ├── icon_iso.png
-│   ├── icon_shutter.png
-│   └── ...
-└── ~/photos/           # Photo storage directory (created automatically)
-```
+I haven’t built a proper case yet. At the moment the prototype is made of cardboard, but it’s neither ergonomic nor does it help with heat dissipation. I’m evaluating different construction materials, and I think the next step will be wood.
+
+Ideally, it should be 3D printed with a specific form factor because, without an optical viewfinder, it would be great to tilt the display like in CinePi, but in a much more compact design. If anyone is skilled in design, feel free to share your projects!
+
 
 ## 🚀 Quick Reference
 
