@@ -87,12 +87,33 @@ The setup script will guide you through:
 1. Installing system dependencies
 2. Configuring boot settings and GPU memory
 3. Fixing display issues (optional)
-4. Setting up directories and permissions
-5. Configuring systemd services
-6. Downloading UI icons
-7. Configuring auto-login (optional)
-8. Configuring camera app autostart (optional)
-9. Configuring WiFi hotspot (optional)
+4. Kernel command line (quiet boot, 32 bpp framebuffer) and on-demand mount
+   of the boot partition
+5. Setting up directories and permissions
+6. Configuring systemd services
+7. Downloading UI icons
+8. Configuring auto-login (optional)
+9. Configuring camera app autostart (optional)
+10. Disabling services that slow down the boot (optional)
+11. Configuring WiFi hotspot (optional)
+
+See [Boot Time](#-boot-time) for what the boot-related steps do and why.
+
+### Updating an installed camera
+
+Copy the new files over and restart the app (the web server only if
+`photo_server.py` changed):
+
+```bash
+scp camera_app.py photo_server.py setup.sh README.md your_username@YOUR_PI_IP:~/raspi/
+```
+
+```bash
+ssh your_username@YOUR_PI_IP "sudo systemctl restart camera-ui photo-server"
+```
+
+System-level changes (boot configuration, service files) are applied by
+re-running `./setup.sh` on the Pi.
 
 ### 5. Reboot
 
@@ -319,12 +340,39 @@ self.picam2.configure(self.picam2.create_preview_configuration(
    sudo journalctl -u camera-ui -n 50
    ```
 
+### "Fotocamera non risponde" on the Viewfinder
+
+The sensor has stopped sending frames. The journal shows `Camera frontend has
+timed out! ... check that your camera sensor connector is attached securely`:
+
+```bash
+journalctl -u camera-ui -b | grep -iE "frontend|No frame|recovered"
+```
+
+This is the CSI link, not the software (the sensor still answers on I2C, but no
+image data arrives). Power off, reseat the ribbon cable at both ends in the
+same orientation and check it for creases; try another cable if it keeps
+happening.
+The app keeps running meanwhile (menu, gallery and shutdown work) and restarts
+the camera every 10 s, so the image comes back on its own if the contact
+recovers. Before, the whole interface froze until a reboot.
+
 ### Display Shows Nothing
 
 1. **Verify framebuffer:**
    ```bash
    ls -l /dev/fb0
    ```
+
+   The app draws straight into `/dev/fb0`. It should belong to the KMS driver
+   (`vc4drmfb`, not `simple`) and the log should say
+   `Display initialized on /dev/fb0`:
+   ```bash
+   cat /sys/class/graphics/fb0/name
+   ```
+
+   To use SDL's KMSDRM output instead (slower to start), add
+   `Environment=CAMERA_DISPLAY=sdl` to `camera-ui.service`.
 
 2. **Test manually:**
    ```bash
@@ -351,7 +399,7 @@ self.picam2.configure(self.picam2.create_preview_configuration(
    xinput_calibrator
    ```
 
-3. **Check touch overlay in `/boot/config.txt`:**
+3. **Check touch overlay in `/boot/firmware/config.txt`:**
    ```
    dtoverlay=ads7846,cs=1,penirq=25,speed=50000...
    ```
@@ -418,9 +466,9 @@ cd ~/raspi
 ./setup.sh  # Answer 'y' to Step 1.6 (display fix)
 ```
 
-Or manually restore KMS drivers in `/boot/config.txt`:
+Or manually restore KMS drivers in `/boot/firmware/config.txt`:
 ```bash
-sudo nano /boot/config.txt
+sudo nano /boot/firmware/config.txt
 # Uncomment or add:
 dtoverlay=vc4-kms-v3d,noaudio
 gpu_mem=128
@@ -503,7 +551,176 @@ Ideally, it should be 3D printed with a specific form factor because, without an
 3. **Remote Control:** Use the `/live` page to avoid touching the camera during capture
 4. **Battery Life:** Enable standby mode when not in use to save power
 5. **Network Switch:** Hotspot takes ~10 seconds to activate/deactivate
-6. **Display Orientation:** Adjust in `/boot/config.txt` with `display_rotate=X` (0,1,2,3)
+6. **Display Orientation:** Adjust in `/boot/firmware/config.txt` with `display_rotate=X` (0,1,2,3)
+
+## ⚡ Boot Time
+
+From power-on to a live viewfinder went from about **70 s to about 18 s** on a
+Pi Zero 2W with the HQ camera and a 3.5" HDMI display (Raspberry Pi OS Trixie
+Lite). Times below are from the start of the kernel, averaged over two reboots;
+the firmware adds about 5 s before that on a reboot (10.4 s before the
+changes, measured on a cold power-on, which is a little slower).
+
+| milestone | before | after |
+|---|---|---|
+| systemd starts (end of kernel stage) | 11.1 s | **3.0 s** |
+| `camera-ui` started | 30.6 s | **6.8 s** |
+| camera streaming | 61.5 s | **12.6 s** |
+| **first frame on screen** | **~62 s** | **13.4 s** |
+| network, SSH and web server up (`multi-user.target`) | 49.9 s | **19.1 s** |
+
+### Measuring
+
+The app logs the number that matters, the first frame on screen relative to
+the kernel start:
+
+```bash
+journalctl -u camera-ui -b | grep -E "First frame|Camera started|Display initialized"
+```
+
+```bash
+systemd-analyze
+```
+
+```bash
+systemd-analyze critical-chain camera-ui.service
+```
+
+The firmware stage is in the VideoCore log (`Starting ARM` is when the kernel
+takes over):
+
+```bash
+sudo vclog --msg | grep -E "kernel8|Starting ARM"
+```
+
+Do not measure while logged in over SSH during the boot: on a Zero 2W an SSH
+login (key exchange, PAM, a `systemd --user` instance) competes with the app
+for CPU and the SD card and skews the numbers by several seconds.
+
+### Where the time went, and what changed
+
+The SD card is the bottleneck: the app pages in ~50 MB of Python modules and
+shared libraries at a few MB/s while the rest of the system boots.
+
+**Firmware / kernel** (Step 1.5, 1.7)
+- `auto_initramfs=0` — the initramfs only redid what the kernel can already do
+  (SD card and ext4 are built in). The firmware spent ~1.4 s reading its 12 MB,
+  and its scripts ran for ~5 s before the root filesystem was even mounted.
+  Applied only when root is ext4 on the SD card.
+- `cmdline.txt` back on **one line**: the firmware reads only the first line, so
+  a `quiet` added on a second line had been silently ignored, and every kernel
+  and systemd message went to the serial console at 115200 baud (~10 ms a line)
+  and to the screen. With the initramfs gone, the kernel stage went from 11.1 s
+  to 3.0 s.
+- `quiet loglevel=3 logo.nologo vt.global_cursor_default=0` (now the default
+  answer).
+- `video=...-32`: the framebuffer is created at 32 bpp, which the app now draws
+  into directly (see below).
+- Unchanged: `boot_delay=0`, `disable_splash=1`, `initial_turbo=30`.
+
+**systemd** (Step 1.8, 6, 6.5)
+- `camera-ui.service` uses `DefaultDependencies=no` and starts once the root
+  filesystem is writable, before `sysinit.target`: swap setup (which `/tmp`
+  waits for), tmpfiles, sockets and timers are not needed for the viewfinder.
+- `IOSchedulingClass=realtime`: the app's reads go ahead of NetworkManager,
+  avahi, dbus etc. (the scheduler is mq-deadline). The network comes up a few
+  seconds after the viewfinder instead of competing with it.
+- `/etc/modules-load.d/camera-ui.conf` loads the display and camera drivers
+  (`vc4`, `bcm2835_unicam_legacy`, `imx477`, `bcm2835_isp` and the I2C
+  controller/mux both depend on) before udev's coldplug, so they are bound
+  ~4 s earlier, before the app needs them.
+- `/boot/firmware` is mounted on first access (`x-systemd.automount`) and not
+  fsck'd: the boot used to wait for its device, a 3 s FAT check and the mount.
+- Disabled on this hardware: `e2scrub_reap` (10 s every boot, only useful with
+  LVM), `dpkg-db-backup`/`man-db`/`e2scrub_all` timers, `rpi-eeprom-update`
+  (no EEPROM on Pi Zero/3), `NetworkManager-wait-online`, `getty@tty1`.
+- Volatile journal; stop timeout capped at 10 s (the app used to take the full
+  90 s to stop when the sensor had hung).
+
+**Application** (`camera_app.py`)
+- **Direct framebuffer output.** SDL's KMSDRM backend always initialises
+  OpenGL ES through Mesa, whose driver library links LLVM: ~70 MB read from the
+  SD card and ~9 s before the first `set_mode()` returned. The UI is drawn with
+  SDL's `dummy` driver and copied into `/dev/fb0` instead (0.1 s to set up,
+  2-3 ms per frame); the text console is switched to graphics mode so it cannot
+  draw over it. The KMSDRM path is kept as an automatic fallback
+  (`CAMERA_DISPLAY=sdl` forces it).
+- pygame's unused optional modules (mixer, imageext, scrap, ...) are not
+  imported: they loaded SDL_mixer and SDL_image with all their codecs. Icons are
+  decoded with PIL, which picamera2 has already loaded.
+- picamera2 is imported only by the camera thread, so the splash is up while
+  libcamera is still loading; evdev, smbus and gpiozero are imported in the
+  background after the first frame.
+- libcamera lists cameras once, when the first `Picamera2()` is created, and a
+  sensor that binds later is never seen. The app now waits until the camera
+  pipeline and the sensor are registered and accessible before that first
+  call. (Before, an early start could leave it without a camera until systemd
+  restarted it.) The framebuffer, touch panel, GPIO chip and I2C bus are
+  likewise waited for or retried rather than given up on.
+- Run as `python3 -c "import camera_app; ..."` so its bytecode is cached.
+- Startup logs are line-buffered: previously Python held them back until ~8 KB
+  had accumulated, so none of the timings above reached the journal.
+
+### Reverting
+
+Every system file is backed up the first time setup.sh changes it:
+
+```bash
+sudo cp /boot/firmware/config.txt.bak_setup /boot/firmware/config.txt
+```
+
+```bash
+sudo cp /boot/firmware/cmdline.txt.bak_setup /boot/firmware/cmdline.txt
+```
+
+```bash
+sudo cp /etc/fstab.bak_setup /etc/fstab
+```
+
+```bash
+sudo rm /etc/modules-load.d/camera-ui.conf
+```
+
+Disabled services come back with `sudo systemctl enable --now <unit>`.
+
+## 🎨 Interface
+
+The UI was restyled without changing any behaviour: every touch target in
+`setup_ui()` keeps its exact geometry, and no control was added, removed or
+rewired.
+
+- **Typography** — FreeSans / FreeSansBold replace pygame's built-in bitmap
+  face. Sizes are multiplied by `FONT_SCALE` (0.78) because a TrueType face at
+  size N renders much larger than `Font(None, N)`; the factor was measured
+  on-device so string widths stay within ~3% of the old font and cannot
+  overflow the unchanged button rects.
+- **Palette** — design tokens (`SURFACE_0…3`, `TEXT_HI/MID/LOW`, `ACCENT`,
+  `SUCCESS`, `DANGER`, `INFO`) replace ad-hoc RGB literals. Amber is the single
+  accent marking active states (B/W, focus peaking, shift, live AE readback).
+- **Camera HUD** — ISO and shutter sit on raised cards; chevrons replace filled
+  triangles; the battery is a pill gauge instead of a bare percentage.
+- **Popups** — one shared scrim/panel helper, filled pill buttons without the
+  dated 1px white outline, WiFi rows as cards with a vector padlock.
+- **Keyboard** — shift and backspace are drawn as vectors. Neither FreeSansBold
+  nor the previous default font actually carries `⇧`/`⌫`, so they had been
+  rendering as tofu boxes.
+
+Two cosmetic bugs were fixed in passing: the tofu keys above, and the gallery
+counter reading `1 / 0` when no photos exist.
+
+### Rendering cost
+
+Measured on the Pi Zero 2W at 640x480 with a synthetic sensor, 5 alternating
+runs (spread under 0.3%):
+
+| | before | after |
+|---|---|---|
+| `draw_camera_ui` | 7.95 ms | **7.27 ms** |
+| full frame | 26.7 ms | 27.5 ms |
+
+Drawing got cheaper despite the richer visuals because static labels and HUD
+strings are now cached instead of re-rendered per glyph every frame. Both
+figures stay under the 33.3 ms budget for the app's 30 fps target.
 
 ## 🤝 Contributing
 
