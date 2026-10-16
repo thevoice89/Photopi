@@ -6,17 +6,21 @@ A lightweight camera application for Raspberry Pi with HQ Camera module, featuri
 
 ## ✨ Features
 
-- 🎥 **Live Camera Preview** with hardware acceleration
-- 📸 **Photo Capture** via GPIO button or touchscreen
-- 🎛️ **Manual Controls** for ISO (100-3200) and Shutter Speed (1/4000s - 1/4s)
+- 🎥 **Live Camera Preview** at 30 fps, ~65 ms from sensor to screen
+- 📸 **Photo Capture** via GPIO button, touchscreen or phone
+- 🎛️ **Manual Controls** for ISO (100-6400) and Shutter Speed (1/2000s - 1/4s)
+- 🎯 **Focus Assist**: focus peaking that lights up only what is really sharp,
+  a 3x/6x magnifier around any point you tap, and a focus meter
 - 🖼️ **Built-in Gallery** with photo browsing and deletion
-- 🌐 **Web Server** for remote access and camera control
-- 📱 **Live Preview Stream** (MJPEG) accessible from any browser
+- 📱 **Web Remote**: live view, shutter, ISO/shutter pickers, focus assist,
+  standby and wake from any phone or computer — and a web gallery with
+  multi-select download and delete
+- 🔳 **QR codes** on the camera screen to open the remote (and to join the
+  hotspot) from your phone
 - 🔋 **Battery Indicator** (compatible with UPS-Lite V1.3)
-- ⚡ **Power Management** with shutdown, standby, and display control
+- ⚡ **Power Management** with shutdown, reboot and standby
 - 🌳 **WiFi Hotspot Mode** for outdoor/portable use
 - 🔌 **WiFi Manager** to connect to networks from the UI
-- 🎨 **Material Design 3** web interface
 
 ## 🔧 Hardware Requirements
 
@@ -87,15 +91,14 @@ The setup script will guide you through:
 1. Installing system dependencies
 2. Configuring boot settings and GPU memory
 3. Fixing display issues (optional)
-4. Kernel command line (quiet boot, 32 bpp framebuffer) and on-demand mount
-   of the boot partition
+4. Kernel command line (quiet boot, 32 bpp framebuffer, 720x480 on the
+   MPI3508 display) and on-demand mount of the boot partition
 5. Setting up directories and permissions
 6. Configuring systemd services
-7. Downloading UI icons
-8. Configuring auto-login (optional)
-9. Configuring camera app autostart (optional)
-10. Disabling services that slow down the boot (optional)
-11. Configuring WiFi hotspot (optional)
+7. Configuring auto-login (optional)
+8. Configuring camera app autostart (optional)
+9. Disabling services that slow down the boot (optional)
+10. Configuring WiFi hotspot (optional)
 
 See [Boot Time](#-boot-time) for what the boot-related steps do and why.
 
@@ -129,24 +132,48 @@ sudo reboot
 
 After reboot, the application starts automatically showing:
 
-- **Live Camera Preview** - Full-screen camera feed
-- **POWER Button** ⚡  - Access power menu
-- **GALLERY Button**  - View captured photos
-- **ISO Controls** (Auto, 100-3200) - Adjust with ▲/▼ buttons
-- **Shutter Speed Controls** (Auto, 1/4000s - 1/4s) - Adjust with ▲/▼ buttons
+- **Live Camera Preview** - 4:3 camera feed between the two sidebars
+- **SHUTTER / ISO** (left) - Adjust with ▲/▼; in Auto the live values are
+  shown in amber
+- **POWER Button** ⚡ (right) - Opens the settings menu
+- **GALLERY Button** - View captured photos
+- **B/W** - Black and white preview and photos
+- **PEAK** - Focus assist (see below)
 - **Battery Indicator** (top-right) - Shows battery percentage if UPS is connected
+- **TELECOMANDO** chip (above the image) - A phone is using the web remote
 
-### Power Menu
+### Focus Assist
 
-Tap the POWER button to access the menu with these options:
+Tap **PEAK** for manual focusing:
 
-- **SHUTDOWN** - Power off the Raspberry Pi completely
-- **STANDBY** - Low-power mode with display off (wake with touch/mouse)
-- **MONITOR OFF** - Turn off display backlight (wake with touch/mouse)
-- **START/STOP HOTSPOT** - Toggle WiFi hotspot mode
-- **WIFI** - Connect to WiFi networks
-- **SERVER** - Start/stop the web server
-- **CANCEL** - Close the menu
+- **Peaking** paints the edges that are in focus. A turn of the focus ring
+  past the sharp point makes them disappear: out-of-focus outlines stay dark,
+  and noise does not light up at high ISO.
+- **Tap the image** to magnify that point 3x (tap again to move the window);
+  the **×1/×3/×6** chip cycles the magnification, with a map of where you are.
+  At 3x one screen pixel is about one sensor pixel, which is where fine focus
+  can actually be judged. Photos are always the full frame.
+- **FOCUS meter**: turn the ring until the bar reaches the white marker (the
+  best value seen in the last few seconds); tap it to start over.
+- The **colour** chip cycles red, yellow, cyan and white; the **bars** chip
+  sets the sensitivity (low, medium, high).
+
+The web remote has the same controls.
+
+### Settings Menu
+
+Tap the POWER button to open the settings:
+
+- **Server web**, **Hotspot** - Tap to switch on or off (state shown live)
+- **Wi-Fi** - Shows the current network; tap to scan and connect. Saved
+  networks connect directly; for the others a full keyboard (letters,
+  numbers, all symbols, show/hide password) asks for the password
+- **Standby** - Display off and sensor stopped; network and web server stay
+  on. Wake with a touch, the shutter button or the web remote
+- **Riavvia** / **Spegni** - Reboot / shut down, after a confirmation
+- **Telecomando** card - The address of the web remote with a QR code: point
+  your phone's camera at it. With the hotspot on there are two codes: the
+  first joins the hotspot's Wi-Fi, the second opens the page
 
 ### Taking Photos
 
@@ -156,27 +183,37 @@ Photos are saved to `~/photos/` with format: `photo_YYYYMMDD_HHMMSS.jpg`
 
 ### Photo Gallery
 
-Tap the "GALLERY" button to view your photos:
-- **PREV/NEXT** - Navigate between photos
-- **DELETE** - Remove the current photo
-- **BACK** - Return to camera mode
+Tap the "GALLERY" button to view your photos (newest first):
+- **Tap the left/right third** - Previous/next photo
+- **Trash** - Delete the current photo, after a confirmation
+- **Back** - Return to camera mode
+
+Each photo shows when it was taken, its shutter speed and ISO.
 
 ### Web Server
 
 The web server starts automatically on port 8080 and provides:
 
 1. **Photo Gallery** at `http://YOUR_PI_IP:8080`
-   - Responsive grid layout with thumbnails
-   - Date and time stamps
-   - Full-screen lightbox view
-   - Auto-refresh every 30 seconds
-   - Download or delete photos
+   - Thumbnails grouped by day (Oggi, Ieri, ...), generated on the Pi and
+     cached, so the grid loads in moments instead of downloading every 2 MB
+     original
+   - Full-screen viewer: swipe or arrow keys, shutter speed / ISO / size,
+     download, delete
+   - Select several photos to download them as one ZIP or delete them
+   - New photos appear by themselves; camera status, free space, standby,
+     reboot and shutdown from the power button
 
-2. **Live Remote Control** at `http://YOUR_PI_IP:8080/live`
-   - Live MJPEG preview stream
-   - Remote capture button
-   - ISO and shutter speed adjustment
-   - Real-time camera status
+2. **Remote Control** at `http://YOUR_PI_IP:8080/live`
+   - Live preview with a rule-of-thirds grid
+   - Shutter button with flash, saving indicator and the last photo's thumbnail
+   - Shutter and ISO as tappable rows of values; live Auto readings
+   - B/N and Focus assist (peaking, magnifier: tap the image, focus meter)
+   - Wakes the camera from standby
+   - Portrait, landscape (controls on the side), tablet and desktop layouts
+
+Both pages work offline (no external fonts or scripts), so they also work on
+the hotspot.
 
 **To find your Raspberry Pi's IP address:**
 ```bash
@@ -193,15 +230,16 @@ http://192.168.1.100:8080/live    # Live remote control
 
 For use without a WiFi router (outdoor photography, events, etc.):
 
-1. Press **POWER** → tap **START HOTSPOT** (purple button)
+1. Press **POWER** → tap the **Hotspot** tile
 2. Wait a few seconds for the network to initialize
-3. From your smartphone/PC, connect to the WiFi network:
+3. Scan the first QR code on the camera screen with your phone to join the
+   network, or connect by hand:
    - **SSID**: `RaspiCam`
    - **Password**: `raspicam_admin`
-4. Open browser and navigate to: `http://10.42.0.1:8080`
+4. Scan the second QR code, or open `http://10.42.0.1:8080/live`
 
 **To return to home WiFi:**
-Press **POWER** → **STOP HOTSPOT** (orange button)
+Press **POWER** → tap the **Hotspot** tile again
 
 ## 🔌 GPIO Wiring
 
@@ -357,6 +395,28 @@ The app keeps running meanwhile (menu, gallery and shutdown work) and restarts
 the camera every 10 s, so the image comes back on its own if the contact
 recovers. Before, the whole interface froze until a reboot.
 
+### Display Backlight Stays On in Standby
+
+Standby switches the HDMI signal off (and any backlight the kernel can
+control). The 3.5" MPI3508 has no software-controllable backlight and keeps
+it lit without a signal: hold its backlight key for 3 seconds to turn it off
+(a short press turns it back on). Standby still stops the sensor and slows
+the CPU down.
+
+### Image Looks Stretched on the 3.5" Display
+
+The MPI3508's panel is 480x320 (3:2) and it scales whatever it receives to
+fill it, so a 4:3 mode such as 640x480 is stretched sideways by 12.5%. Use a
+3:2 mode, which `setup.sh` (Step 1.7) sets when it finds this display:
+
+```bash
+grep -o "video=[^ ]*" /boot/firmware/cmdline.txt
+```
+
+It should read `video=HDMI-A-1:720x480M-32@60`; change it and reboot if it
+does not. 720x480 scales evenly by 2/3. The interface adapts to the
+resolution.
+
 ### Display Shows Nothing
 
 1. **Verify framebuffer:**
@@ -505,8 +565,9 @@ sudo reboot
 - **Network Security:** Web server is only accessible on the local network (not from the Internet)
 - **Auto-login Security:** Auto-login disables password prompt at boot. Only use on devices in controlled environments.
 - **Power Management:** The setup script automatically configures sudo permissions for shutdown and display control
-- **Display Backlight:** Uses sysfs backlight control (compatible with KMS/DRM drivers)
-- **Wake from Standby:** Display automatically wakes on touch or mouse movement
+- **Display Backlight:** Standby powers the video output down through KMS and switches sysfs backlights (DSI/SPI panels) off; HDMI panels like the MPI3508 keep their own backlight on (see Troubleshooting)
+- **Wake from Standby:** Touch, the shutter button, or Risveglia on the web remote
+- **Standby and the network:** The web server and the hotspot stay up in standby, so photos can still be downloaded. Raspberry Pi kernels have no system sleep state, so this is as deep as standby gets
 - **Hotspot IP:** When hotspot is active, the Pi is always accessible at `10.42.0.1`
 
 ## 🔒 Security Considerations
@@ -538,7 +599,7 @@ Ideally, it should be 3D printed with a specific form factor because, without an
 | Start camera manually | `cd ~/raspi && python3 camera_app.py` |
 | View server logs | `sudo journalctl -u photo-server -f` |
 | Check WiFi IP | `hostname -I` |
-| Enable hotspot | Power menu → START HOTSPOT |
+| Enable hotspot | Power menu → Hotspot tile |
 | Access local gallery | `http://YOUR_IP:8080` |
 | Access hotspot gallery | `http://10.42.0.1:8080` |
 | Remote control | `http://YOUR_IP:8080/live` |
@@ -615,7 +676,8 @@ shared libraries at a few MB/s while the rest of the system boots.
 - `quiet loglevel=3 logo.nologo vt.global_cursor_default=0` (now the default
   answer).
 - `video=...-32`: the framebuffer is created at 32 bpp, which the app now draws
-  into directly (see below).
+  into directly (see below). On the MPI3508 the mode is 720x480 (see
+  Troubleshooting).
 - Unchanged: `boot_delay=0`, `disable_splash=1`, `initial_turbo=30`.
 
 **systemd** (Step 1.8, 6, 6.5)
@@ -721,6 +783,61 @@ runs (spread under 0.3%):
 Drawing got cheaper despite the richer visuals because static labels and HUD
 strings are now cached instead of re-rendered per glyph every frame. Both
 figures stay under the 33.3 ms budget for the app's 30 fps target.
+
+### Menus, focus assist and viewfinder latency (October 2026)
+
+- **Menus** — a settings screen in the style of a phone's control centre over
+  a blurred copy of the viewfinder: toggle tiles that show their live state
+  and a spinner while systemctl/nmcli run (in the background: the UI no
+  longer freezes for seconds), confirmation before reboot, shutdown and
+  delete, toasts for results, and QR codes for the web remote. Icons are
+  vector-drawn 4x oversize and scaled down, so they are anti-aliased. Menus
+  are rendered once per change, not every frame.
+- **Wi-Fi** — list with signal icons, saved networks connect without a
+  password, pages for long lists; the keyboard has every ASCII symbol (the old
+  one had none, so many passwords could not be typed), caps lock, and
+  show/hide password. Connecting no longer blocks the UI.
+- **Focus peaking** — second derivatives of a lightly smoothed luminance,
+  thresholded at a sensitivity level or above the measured noise floor. The
+  old filter (Laplacian, 97th-percentile threshold) always lit 3% of the
+  frame, sharp or not, and wrapped edges around the borders. It runs on its
+  own core and costs the viewfinder ~2 ms instead of ~70 ms.
+- **Gallery** — photos are decoded at screen size with JPEG draft mode and
+  cached with their neighbours; the old gallery decoded the full 12 MP file
+  on every frame.
+- **Standby** — kept the web server stopped after waking (it never restarted
+  it), tried sleep states the kernel does not have, and wrote GPIO/LED paths
+  that no longer exist on kernel 6.12. Now: HDMI output off through KMS,
+  sensor stopped, `powersave` governor, slow LED blink; everything is put back
+  on wake, at the next start if the app was killed in standby, and on
+  `systemctl stop` (SIGTERM now runs the cleanup).
+- **Display mode** — 720x480 instead of 640x480 on the MPI3508, whose
+  480x320 panel is 3:2 (see Troubleshooting). The viewfinder grew from
+  354x236 to 353x265 panel pixels with the right proportions.
+
+Viewfinder measured on the Pi Zero 2W with the real camera: time from the
+sensor timestamp to the frame being in the framebuffer (`SensorTimestamp` vs
+the copy into `/dev/fb0`), 20 s per run:
+
+| | fps | sensor → screen, mean / p95 |
+|---|---|---|
+| before, 640x480 | 21 | 89 / 106 ms |
+| before, 640x480, peaking on | 6.6 | ~195 ms |
+| **after, 720x480** | **30** | **65 / 67 ms** |
+| **after, 720x480, peaking + web remote** | **30** | **74 / 80 ms** |
+
+About 47 ms of that is the sensor readout and the ISP, before the app sees the
+frame. What changed in the app:
+
+- frames are handed to pygame as BGR (`frombuffer(..., "BGR")`); the
+  `frame[:, :, ::-1]` copy cost ~15 ms per frame
+- the remote's JPEG is encoded on a worker thread, and only while a page or
+  stream is open
+- exposure and gain are read from the viewfinder's own request: the
+  separate `capture_metadata()` thread took a frame away every 0.4 s
+- three camera buffers instead of two: picamera2 keeps the latest frame
+  aside, which left the sensor short of buffers (23 fps with peaking on)
+- no 30 fps tick on top of the camera's own pacing
 
 ## 🤝 Contributing
 

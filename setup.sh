@@ -185,6 +185,16 @@ setup_cmdline() {
     CMDLINE=$(tr '\n' ' ' < "$BOOT_CMDLINE" | tr -s ' ')
     CMDLINE="${CMDLINE% }"
 
+    # The 3.5" MPI3508 HDMI display scales any input to its 480x320 panel,
+    # which is 3:2. A 4:3 mode such as 640x480 came out stretched sideways
+    # (12.5%); 720x480 has the panel's shape and scales evenly by 2/3. Its
+    # EDID names the model.
+    if grep -qa "MPI3508" /sys/class/drm/card*-HDMI-A-*/edid 2>/dev/null; then
+        CMDLINE=$(echo "$CMDLINE" | sed -E 's/ ?video=HDMI-A-1:[^ ]+//')
+        CMDLINE="$CMDLINE video=HDMI-A-1:720x480M-32@60"
+        print_success "MPI3508 display: 720x480, the same 3:2 shape as its panel"
+    fi
+
     # camera_app.py draws straight into the framebuffer, which the KMS driver
     # creates at 16 bpp unless the video= mode asks otherwise; at 16 bpp every
     # frame is converted and colour depth drops. Only an existing video= mode
@@ -338,9 +348,6 @@ setup_directories() {
     mkdir -p ~/photos
     chmod 755 ~/photos
     
-    echo "📁 Creating assets directory..."
-    mkdir -p assets
-    
     print_success "Directories created"
     echo ""
 }
@@ -394,46 +401,12 @@ $USER ALL=(ALL) NOPASSWD: /usr/bin/tee
 $USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl suspend
 $USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl reboot
 $USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl poweroff
+$USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl start photo-server
+$USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop photo-server
 SUDOEOF
     sudo chmod 0440 /etc/sudoers.d/camera-app
     
     print_success "System services configured"
-    echo ""
-}
-
-# Step 4: Download UI icons
-download_icons() {
-    print_header "Step 4: Downloading UI Icons"
-    
-    BASE_URL="https://material-icons.github.io/material-icons-png/png/white"
-    SUFFIX="round-4x.png"
-    
-    download_icon() {
-        local name=$1
-        local url_part=$2
-        local filename="icon_${name}.png"
-        if curl -s -f -o "assets/$filename" "$BASE_URL/$url_part/$SUFFIX" 2>/dev/null; then
-            echo "  ✓ $name"
-        else
-            echo "  ⚠️  Failed: $name (optional)"
-        fi
-    }
-    
-    download_icon "gallery" "photo_library"
-    download_icon "power" "power_settings_new"
-    download_icon "iso" "iso"
-    
-    if curl -s -f -o "assets/icon_shutter.png" "$BASE_URL/shutter_speed/$SUFFIX" 2>/dev/null; then
-        echo "  ✓ shutter"
-    else
-        curl -s -f -o "assets/icon_shutter.png" "$BASE_URL/timer/$SUFFIX" 2>/dev/null && echo "  ✓ shutter (timer)" || echo "  ⚠️  Failed: shutter (optional)"
-    fi
-    
-    download_icon "arrow_left" "chevron_left"
-    download_icon "arrow_right" "chevron_right"
-    download_icon "back" "arrow_back"
-    
-    print_success "Icons downloaded"
     echo ""
 }
 
@@ -716,7 +689,6 @@ main() {
     echo "  1.8 Mount the boot partition on demand"
     echo "  2. Set up directories and permissions"
     echo "  3. Configure systemd services"
-    echo "  4. Download UI icons"
     echo "  5. Configure auto-login (optional)"
     echo "  6. Configure camera app autostart (optional)"
     echo "  6.5 Disable boot-delaying services (optional)"
@@ -734,7 +706,6 @@ main() {
     setup_fstab
     setup_directories
     setup_services
-    download_icons
     setup_autologin
     setup_autostart
     setup_boot_services

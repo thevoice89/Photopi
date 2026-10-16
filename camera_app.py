@@ -41,7 +41,9 @@ import math
 import threading
 from datetime import datetime
 from pathlib import Path
+import glob
 import queue
+import signal
 import socket
 import json
 import subprocess
@@ -67,6 +69,7 @@ _preload_thread = threading.Thread(target=_preload_camera_stack, daemon=True)
 _preload_thread.start()
 
 import pygame
+from pygame import gfxdraw  # anti-aliased circles for the menus
 # Already loaded by pygame.surfarray, so this costs nothing extra.
 import numpy as np
 
@@ -193,6 +196,23 @@ CAMERA_RESTART_WAIT = 1.0
 STILL_TIMEOUT = 10.0
 SHARED_MEM_PREVIEW = "/tmp/camera_preview.jpg"
 SHARED_MEM_STATUS = "/tmp/camera_status.json"
+# The web remote (photo_server.py) checks in every few seconds; preview JPEGs
+# are encoded only while it does, at up to REMOTE_FPS.
+REMOTE_TIMEOUT = 10.0
+REMOTE_FPS = 8
+# camera_status.json carries the settings the web pages show.
+STATUS_INTERVAL = 0.5
+SERVER_PORT = 8080
+# Hotspot profile created by setup.sh (Step 7). SSID and password are read
+# back from NetworkManager when possible; these are setup.sh's defaults.
+HOTSPOT_CONNECTION = "RaspiCam_Hotspot"
+HOTSPOT_SSID = "RaspiCam"
+HOTSPOT_PASSWORD = "raspicam_admin"
+HOTSPOT_IP = "10.42.0.1"
+# Standby: the CPU governor used while asleep, and the green LED blinking
+# slowly so the camera does not look switched off.
+CPUFREQ_GOVERNOR = "/sys/devices/system/cpu/cpufreq/policy0/scaling_governor"
+ACT_LED = "/sys/class/leds/ACT"
 
 # Display output (see FramebufferOutput). CAMERA_DISPLAY=sdl forces the old
 # SDL/KMSDRM path.
@@ -250,6 +270,14 @@ def load_font(size, bold=False):
     except Exception:
         return pygame.font.Font(None, size)
 
+
+def ui_font(px, bold=False):
+    """FreeSans at a pixel size, for the menus (load_font() sizes are in the old font's units)."""
+    try:
+        return pygame.font.Font(FONT_BOLD if bold else FONT_REGULAR, px)
+    except Exception:
+        return pygame.font.Font(None, int(px / FONT_SCALE))
+
 # ISO and Shutter Speed options
 ISO_VALUES = ["Auto", 100, 200, 400, 800, 1600, 3200, 6400]
 SHUTTER_SPEEDS = [
@@ -267,6 +295,22 @@ SHUTTER_SPEEDS = [
     ("1/8", 125000),
     ("1/4", 250000)
 ]
+
+# --- Focus assist ---------------------------------------------------------------
+# IMX477 pixel array: ScalerCrop rectangles and still captures use these units.
+SENSOR_SIZE = (4056, 3040)
+# Magnifier steps. The preview comes from the 2x2-binned 2028x1520 mode, so at
+# 3x one preview pixel is about one binned sensor pixel; 6x enlarges further.
+ZOOM_LEVELS = (1, 3, 6)
+PEAK_COLORS = (("Rosso", (255, 48, 48)), ("Giallo", (255, 214, 10)),
+               ("Ciano", (40, 210, 255)), ("Bianco", (255, 255, 255)))
+# Sensitivity: base threshold on the peaking response (see FocusPeaker). It is
+# raised automatically to PEAK_NOISE_FACTOR times the noise floor at high ISO.
+PEAK_LEVELS = (("Bassa", 120), ("Media", 84), ("Alta", 56))
+PEAK_NOISE_FACTOR = 4.0
+# The peaking filter runs on its own core at up to this rate; the viewfinder
+# paints the latest result on every frame.
+PEAK_INTERVAL = 1 / 15
 
 
 class FramebufferOutput:
@@ -435,14 +479,606 @@ def _uptime():
         return float("nan")
 
 
+
+
+# --- QR codes -------------------------------------------------------------------
+# The system menu shows QR codes for the remote page and, with the hotspot on,
+# for joining its network. Minimal encoder: byte mode, error correction level
+# M, versions 1-10 (up to 213 bytes), standard mask selection.
+
+_QR_BLOCKS_M = {  # version: (EC codewords per block, ((blocks, data codewords), ...))
+    1: (10, ((1, 16),)), 2: (16, ((1, 28),)), 3: (26, ((1, 44),)),
+    4: (18, ((2, 32),)), 5: (24, ((2, 43),)), 6: (16, ((4, 27),)),
+    7: (18, ((4, 31),)), 8: (22, ((2, 38), (2, 39))),
+    9: (22, ((3, 36), (2, 37))), 10: (26, ((4, 43), (1, 44))),
+}
+_QR_ALIGN = {1: (), 2: (6, 18), 3: (6, 22), 4: (6, 26), 5: (6, 30), 6: (6, 34),
+             7: (6, 22, 38), 8: (6, 24, 42), 9: (6, 26, 46), 10: (6, 28, 50)}
+_QR_MASKS = (
+    lambda r, c: (r + c) % 2 == 0,
+    lambda r, c: r % 2 == 0,
+    lambda r, c: c % 3 == 0,
+    lambda r, c: (r + c) % 3 == 0,
+    lambda r, c: (r // 2 + c // 3) % 2 == 0,
+    lambda r, c: (r * c) % 2 + (r * c) % 3 == 0,
+    lambda r, c: ((r * c) % 2 + (r * c) % 3) % 2 == 0,
+    lambda r, c: ((r + c) % 2 + (r * c) % 3) % 2 == 0,
+)
+
+_GF_EXP = [0] * 512
+_GF_LOG = [0] * 256
+_gf = 1
+for _i in range(255):
+    _GF_EXP[_i] = _gf
+    _GF_LOG[_gf] = _i
+    _gf <<= 1
+    if _gf & 0x100:
+        _gf ^= 0x11D
+for _i in range(255, 512):
+    _GF_EXP[_i] = _GF_EXP[_i - 255]
+
+
+def _gf_mul(a, b):
+    return 0 if a == 0 or b == 0 else _GF_EXP[_GF_LOG[a] + _GF_LOG[b]]
+
+
+def _rs_remainder(data, n):
+    """Reed-Solomon error correction codewords for one block."""
+    gen = [1]
+    for i in range(n):
+        gen = [a ^ _gf_mul(b, _GF_EXP[i]) for a, b in zip(gen + [0], [0] + gen)]
+    res = list(data) + [0] * n
+    for i in range(len(data)):
+        coef = res[i]
+        if coef:
+            for j in range(1, n + 1):
+                res[i + j] ^= _gf_mul(gen[j], coef)
+    return res[len(data):]
+
+
+def _qr_penalty(m):
+    """ISO 18004 mask penalty (rules N1-N4)."""
+    size = len(m)
+    cols = [list(c) for c in zip(*m)]
+    score = 0
+    finder = [True, False, True, True, True, False, True, False, False, False, False]
+    finder_rev = finder[::-1]
+    for line in m + cols:
+        run, prev = 0, None
+        for v in line:
+            if v == prev:
+                run += 1
+            else:
+                if run >= 5:
+                    score += run - 2
+                run, prev = 1, v
+        if run >= 5:
+            score += run - 2
+        for i in range(size - 10):
+            seg = line[i:i + 11]
+            if seg == finder or seg == finder_rev:
+                score += 40
+    for r in range(size - 1):
+        for c in range(size - 1):
+            if m[r][c] == m[r][c + 1] == m[r + 1][c] == m[r + 1][c + 1]:
+                score += 3
+    dark = sum(map(sum, m))
+    score += 10 * (abs(dark * 20 - size * size * 10) // (size * size))
+    return score
+
+
+def qr_matrix(text):
+    """QR code for `text` as rows of booleans (True = dark), without quiet zone."""
+    data = text.encode("utf-8")
+    for version in range(1, 11):
+        ec_len, groups = _QR_BLOCKS_M[version]
+        capacity = sum(n * k for n, k in groups)
+        count_bits = 8 if version < 10 else 16
+        if 4 + count_bits + 8 * len(data) <= 8 * capacity:
+            break
+    else:
+        raise ValueError("text too long for a QR code")
+
+    bits = []
+
+    def put(value, length):
+        bits.extend((value >> i) & 1 for i in range(length - 1, -1, -1))
+
+    put(0b0100, 4)
+    put(len(data), count_bits)
+    for byte in data:
+        put(byte, 8)
+    put(0, min(4, 8 * capacity - len(bits)))
+    put(0, -len(bits) % 8)
+    codewords = [int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8)]
+    codewords += [(0xEC, 0x11)[i % 2] for i in range(capacity - len(codewords))]
+
+    blocks, pos = [], 0
+    for count, length in groups:
+        for _ in range(count):
+            blocks.append(codewords[pos:pos + length])
+            pos += length
+    ecc = [_rs_remainder(b, ec_len) for b in blocks]
+    stream = []
+    for i in range(max(len(b) for b in blocks)):
+        stream += [b[i] for b in blocks if i < len(b)]
+    for i in range(ec_len):
+        stream += [e[i] for e in ecc]
+
+    size = 17 + 4 * version
+    dark = [[False] * size for _ in range(size)]
+    fixed = [[False] * size for _ in range(size)]
+
+    def set_fixed(r, c, value):
+        dark[r][c] = bool(value)
+        fixed[r][c] = True
+
+    # Finder patterns and their separators
+    for r0, c0 in ((0, 0), (0, size - 7), (size - 7, 0)):
+        for dr in range(-1, 8):
+            for dc in range(-1, 8):
+                r, c = r0 + dr, c0 + dc
+                if 0 <= r < size and 0 <= c < size:
+                    ring = max(abs(dr - 3), abs(dc - 3))
+                    set_fixed(r, c, ring not in (2, 4))
+    # Alignment patterns, except where they would overlap a finder
+    align = _QR_ALIGN[version]
+    for r in align:
+        for c in align:
+            if (r, c) in ((6, 6), (6, align[-1]), (align[-1], 6)):
+                continue
+            for dr in range(-2, 3):
+                for dc in range(-2, 3):
+                    set_fixed(r + dr, c + dc, max(abs(dr), abs(dc)) != 1)
+    # Timing patterns
+    for i in range(size):
+        if not fixed[6][i]:
+            set_fixed(6, i, i % 2 == 0)
+        if not fixed[i][6]:
+            set_fixed(i, 6, i % 2 == 0)
+    # Format information (written after masking) and the dark module
+    for i in range(9):
+        fixed[8][i] = fixed[i][8] = True
+    for i in range(8):
+        fixed[8][size - 1 - i] = fixed[size - 1 - i][8] = True
+    set_fixed(size - 8, 8, True)
+    # Version information
+    if version >= 7:
+        rem = version
+        for _ in range(12):
+            rem = (rem << 1) ^ ((rem >> 11) * 0x1F25)
+        vbits = version << 12 | rem
+        for i in range(18):
+            a, b = size - 11 + i % 3, i // 3
+            set_fixed(b, a, (vbits >> i) & 1)
+            set_fixed(a, b, (vbits >> i) & 1)
+
+    # Data, in two-module columns zigzagging up and down from the bottom right
+    data_bits = [(cw >> i) & 1 for cw in stream for i in range(7, -1, -1)]
+    k = 0
+    upward = True
+    col = size - 1
+    while col > 0:
+        if col == 6:
+            col -= 1
+        for i in range(size):
+            r = size - 1 - i if upward else i
+            for c in (col, col - 1):
+                if not fixed[r][c]:
+                    dark[r][c] = k < len(data_bits) and data_bits[k] == 1
+                    k += 1
+        upward = not upward
+        col -= 2
+
+    def masked(mask_id):
+        m = [row[:] for row in dark]
+        fn = _QR_MASKS[mask_id]
+        for r in range(size):
+            for c in range(size):
+                if not fixed[r][c] and fn(r, c):
+                    m[r][c] = not m[r][c]
+        # Format bits: level M (00) and the mask, BCH(15,5), XOR 0x5412
+        rem = mask_id
+        for _ in range(10):
+            rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+        fbits = (mask_id << 10 | rem) ^ 0x5412
+
+        def bit(i):
+            return (fbits >> i) & 1 == 1
+
+        for i in range(6):
+            m[i][8] = bit(i)
+        m[7][8] = bit(6)
+        m[8][8] = bit(7)
+        m[8][7] = bit(8)
+        for i in range(9, 15):
+            m[8][14 - i] = bit(i)
+        for i in range(8):
+            m[8][size - 1 - i] = bit(i)
+        for i in range(8, 15):
+            m[size - 15 + i][8] = bit(i)
+        m[size - 8][8] = True
+        return m
+
+    candidates = [masked(i) for i in range(8)]
+    return min(candidates, key=_qr_penalty)
+
+
+# --- Focus peaking -----------------------------------------------------------------
+class FocusPeaker:
+    """Focus peaking and focus meter, computed off the main thread.
+
+    The viewfinder hands over the green channel of a preview frame and paints
+    the latest result into the next frames, so peaking costs the main loop
+    ~2 ms instead of the ~70 ms the old in-line filter took on a Pi Zero 2W.
+    numpy releases the GIL in its loops, so the filter runs on another core.
+
+    Filter: second derivative along x and along y, each taken on an image
+    smoothed with [1 2 1] across the derivative. Unlike a gradient it barely
+    responds to soft, high-contrast outlines, so out-of-focus edges stay dark,
+    and the smoothing keeps sensor noise from lighting up at high ISO. The
+    threshold is the sensitivity level or PEAK_NOISE_FACTOR times the median
+    response (the noise floor), whichever is higher: the old fixed 97th
+    percentile lit 3% of the frame even with nothing in focus.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._job = None
+        self._running = True
+        self.busy = False
+        self.generation = 0
+        self.result = None   # (generation, frame shape, flat pixel indices)
+        self.score = None    # focus meter for the last frame processed
+        self._noise = None
+        self._buffers = None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def submit(self, frame, threshold):
+        """Queue a frame (BGR or RGB, HxWx3); replaces any frame still waiting."""
+        green = np.ascontiguousarray(frame[:, :, 1])
+        with self._cond:
+            self._job = (green, threshold, self.generation)
+            self.busy = True
+            self._cond.notify()
+
+    def reset(self):
+        """Drop results: the view changed (zoom, peaking toggled)."""
+        with self._cond:
+            self.generation += 1
+            self._job = None
+        self.result = None
+        self.score = None
+        self._noise = None
+
+    def stop(self):
+        with self._cond:
+            self._running = False
+            self._cond.notify()
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while self._running and self._job is None:
+                    self.busy = False
+                    self._cond.wait()
+                if not self._running:
+                    return
+                green, threshold, generation = self._job
+                self._job = None
+            try:
+                indices, score = self._process(green, threshold)
+            except Exception as e:
+                print(f"Focus peaking error: {e}")
+                continue
+            if generation == self.generation:
+                self.result = (generation, green.shape, indices)
+                self.score = score
+
+    def _process(self, g, threshold):
+        h, w = g.shape
+        if self._buffers is None or self._buffers[0].shape != (h, w):
+            # Reused from frame to frame: fresh 600 KB arrays on every call
+            # made the filter ~40% slower on a Pi Zero 2W.
+            self._buffers = (np.empty((h, w), np.int16), np.empty((h - 2, w), np.int16),
+                             np.empty((h, w - 2), np.int16), np.empty((h - 2, w - 2), np.int16),
+                             np.empty((h - 2, w - 2), np.int16), np.empty((h - 2, w - 2), bool),
+                             np.empty((h - 2, w - 2), bool))
+        gi, sv, sh, resp, dyy, mask, thick = self._buffers
+        gi[...] = g
+        # d2/dx2 of the image smoothed vertically with [1 2 1]
+        np.add(gi[:-2], gi[2:], out=sv)
+        sv += gi[1:-1]
+        sv += gi[1:-1]
+        np.add(sv[:, 1:-1], sv[:, 1:-1], out=resp)
+        resp -= sv[:, :-2]
+        resp -= sv[:, 2:]
+        np.abs(resp, out=resp)
+        # d2/dy2 of the image smoothed horizontally
+        np.add(gi[:, :-2], gi[:, 2:], out=sh)
+        sh += gi[:, 1:-1]
+        sh += gi[:, 1:-1]
+        np.add(sh[1:-1], sh[1:-1], out=dyy)
+        dyy -= sh[:-2]
+        dyy -= sh[2:]
+        np.abs(dyy, out=dyy)
+        resp += dyy                      # (h-2, w-2), at most 8160: fits int16
+
+        noise = float(np.median(resp[::4, ::4]))
+        self._noise = noise if self._noise is None else 0.7 * self._noise + 0.3 * noise
+        np.greater(resp, max(threshold, PEAK_NOISE_FACTOR * self._noise), out=mask)
+        # One pixel thicker, so lines survive the nearest-neighbour downscale
+        thick[...] = mask
+        thick[:, 1:] |= mask[:, :-1]
+        thick[1:] |= mask[:-1]
+        rows, cols = np.divmod(np.flatnonzero(thick), w - 2)
+        indices = (rows + 1) * w + (cols + 1)
+
+        # Focus meter: mean response above twice the noise floor, centre of
+        # the view (the magnifier recentres it on the tapped point).
+        rh, rw = resp.shape
+        roi = resp[rh // 4: rh - rh // 4, rw // 4: rw - rw // 4]
+        floor = 2.0 * self._noise
+        score = float(np.mean(np.maximum(roi, floor))) - floor
+        return indices, score
+
+
+class RemotePreviewWriter:
+    """Encodes the web remote's preview JPEG on a worker thread.
+
+    PIL releases the GIL while it encodes, so the ~20 ms per frame no longer
+    comes out of the viewfinder's 33 ms budget. Frames that arrive while one is
+    being encoded replace each other.
+    """
+
+    def __init__(self, path, quality=80):
+        self.path = path
+        self.quality = quality
+        self._cond = threading.Condition()
+        self._frame = None
+        self._running = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def submit(self, frame):
+        """Queue a BGR preview frame; the caller must not modify it afterwards."""
+        with self._cond:
+            self._frame = frame
+            self._cond.notify()
+
+    def stop(self):
+        with self._cond:
+            self._running = False
+            self._cond.notify()
+
+    def _run(self):
+        tmp = f"{self.path}.tmp"
+        while True:
+            with self._cond:
+                while self._running and self._frame is None:
+                    self._cond.wait()
+                if not self._running:
+                    return
+                frame, self._frame = self._frame, None
+            try:
+                h, w = frame.shape[:2]
+                img = _pil_image().frombuffer("RGB", (w, h), np.ascontiguousarray(frame),
+                                              "raw", "BGR", 0, 1)
+                img.save(tmp, "JPEG", quality=self.quality)
+                os.replace(tmp, self.path)
+            except Exception as e:
+                print(f"Remote preview error: {e}")
+
+
+# --- System helpers ------------------------------------------------------------------
+def _nmcli_fields(line):
+    """Split a line of `nmcli -t` output: ':' separates fields, '\\:' is a literal colon."""
+    fields, cur, escaped = [], [], False
+    for ch in line:
+        if escaped:
+            cur.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == ":":
+            fields.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    fields.append("".join(cur))
+    return fields
+
+
+def _run_quiet(cmd, timeout=5):
+    """Run a command, returning (returncode, stdout); never raises."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout
+    except Exception as e:
+        return -1, str(e)
+
+
+def _local_ip():
+    """Address of the interface carrying the default route, or None."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            ip = s.getsockname()[0]
+        return None if ip.startswith("127.") else ip
+    except OSError:
+        return None
+
+
+def _read_sysfs(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _write_sysfs(writes):
+    """Write sysfs attributes [(path, value)], through sudo for root-only ones.
+
+    Everything that needs root goes into a single `sudo bash` call (bash and
+    tee are what setup.sh's sudoers entry allows), so standby and wake cost one
+    process start instead of one per attribute.
+    """
+    pending = []
+    for path, value in writes:
+        try:
+            with open(path, "w") as f:
+                f.write(str(value))
+        except PermissionError:
+            pending.append((path, str(value)))
+        except OSError as e:
+            print(f"sysfs {path}: {e}")
+    if not pending:
+        return
+    script = 'while [ $# -gt 1 ]; do printf %s "$2" > "$1" || r=1; shift 2; done; exit ${r:-0}'
+    args = [x for pair in pending for x in pair]
+    code, out = _run_quiet(["sudo", "-n", "/bin/bash", "-c", script, "bash", *args])
+    if code != 0:
+        print(f"sysfs write failed ({code}): {out.strip()}")
+
+
+# --- Vector icons ---------------------------------------------------------------------
+# Drawn 4x oversize and smooth-scaled down (see CameraApp._icon), which gives
+# the menus anti-aliased glyphs; pygame's own primitives are not anti-aliased.
+
+def _arc_band(surf, color, center, radius, width, a0, a1):
+    """Thick arc as a polygon; angles in degrees, counter-clockwise from +x.
+
+    pygame.draw.arc leaves gaps between its 1px passes at large widths.
+    """
+    cx, cy = center
+    steps = max(6, int(abs(a1 - a0) / 5))
+    r_out, r_in = radius + width / 2, radius - width / 2
+    outer, inner = [], []
+    for i in range(steps + 1):
+        a = math.radians(a0 + (a1 - a0) * i / steps)
+        ca, sa = math.cos(a), -math.sin(a)
+        outer.append((cx + r_out * ca, cy + r_out * sa))
+        inner.append((cx + r_in * ca, cy + r_in * sa))
+    pygame.draw.polygon(surf, color, outer + inner[::-1])
+    for a in (a0, a1):
+        ra = math.radians(a)
+        pygame.draw.circle(surf, color, (cx + radius * math.cos(ra), cy - radius * math.sin(ra)),
+                           width / 2)
+
+
+def _stroke(surf, color, points, width):
+    """Polyline with round joins and caps."""
+    pygame.draw.lines(surf, color, False, points, int(width))
+    for p in points:
+        pygame.draw.circle(surf, color, p, width / 2)
+
+
+def _draw_icon_shape(surf, name, s, color, level=4):
+    """Draw icon `name` filling an s x s canvas (s is the oversampled size)."""
+    c = s / 2
+    w = max(2, s * 0.085)
+    dim = (*color[:3], 70)
+    if name == "dot":
+        pygame.draw.circle(surf, color, (c, c), c)
+    elif name == "ring":
+        pygame.draw.circle(surf, color, (c, c), c - 1, max(2, int(s * .05)))
+    elif name == "close":
+        _stroke(surf, color, [(s * .3, s * .3), (s * .7, s * .7)], w)
+        _stroke(surf, color, [(s * .7, s * .3), (s * .3, s * .7)], w)
+    elif name == "back":
+        _stroke(surf, color, [(s * .6, s * .24), (s * .34, s * .5), (s * .6, s * .76)], w)
+    elif name == "next":
+        _stroke(surf, color, [(s * .4, s * .24), (s * .66, s * .5), (s * .4, s * .76)], w)
+    elif name == "up":
+        _stroke(surf, color, [(s * .24, s * .6), (s * .5, s * .34), (s * .76, s * .6)], w)
+    elif name == "down":
+        _stroke(surf, color, [(s * .24, s * .4), (s * .5, s * .66), (s * .76, s * .4)], w)
+    elif name in ("refresh", "reboot"):
+        _arc_band(surf, color, (c, c), s * .3, w, 110, 400)
+        a = math.radians(110)
+        tip = (c + s * .3 * math.cos(a), c - s * .3 * math.sin(a))
+        head = s * .16
+        pygame.draw.polygon(surf, color, [
+            (tip[0] + head * .9, tip[1] - head * .55),
+            (tip[0] - head * .25, tip[1] - head * .05),
+            (tip[0] + head * .5, tip[1] + head * .85)])
+        if name == "reboot":
+            pygame.draw.circle(surf, color, (c, c), w * .8)
+    elif name == "globe":
+        r = s * .36
+        pygame.draw.circle(surf, color, (c, c), r, int(w))
+        pygame.draw.ellipse(surf, color, (c - r * .45, c - r, r * .9, r * 2), int(w))
+        pygame.draw.line(surf, color, (c - r, c), (c + r, c), int(w))
+        pygame.draw.line(surf, color, (c - r * .82, c - r * .5), (c + r * .82, c - r * .5), int(w * .8))
+        pygame.draw.line(surf, color, (c - r * .82, c + r * .5), (c + r * .82, c + r * .5), int(w * .8))
+    elif name == "hotspot":
+        pygame.draw.circle(surf, color, (c, c), s * .085)
+        for r in (s * .2, s * .34):
+            _arc_band(surf, color, (c, c), r, w, -40, 40)
+            _arc_band(surf, color, (c, c), r, w, 140, 220)
+    elif name == "wifi":
+        base = (c, s * .78)
+        pygame.draw.circle(surf, color if level > 0 else dim, base, s * .075)
+        for i, r in enumerate((s * .23, s * .39, s * .55)):
+            _arc_band(surf, color if level > i + 1 else dim, base, r, w, 48, 132)
+    elif name == "moon":
+        pygame.draw.circle(surf, color, (c, c), s * .34)
+        pygame.draw.circle(surf, (0, 0, 0, 0), (c + s * .17, c - s * .13), s * .29)
+    elif name == "power":
+        _arc_band(surf, color, (c, c), s * .3, w, 125, 415)
+        _stroke(surf, color, [(c, s * .14), (c, s * .46)], w)
+    elif name == "lock":
+        body = pygame.Rect(s * .24, s * .46, s * .52, s * .38)
+        pygame.draw.rect(surf, color, body, border_radius=int(s * .08))
+        _arc_band(surf, color, (c, s * .46), s * .16, w * .9, 0, 180)
+        _stroke(surf, color, [(c - s * .16, s * .46), (c - s * .16, s * .5)], w * .9)
+        _stroke(surf, color, [(c + s * .16, s * .46), (c + s * .16, s * .5)], w * .9)
+    elif name in ("eye", "eye_off"):
+        _arc_band(surf, color, (c, c + s * .3), s * .42, w, 48, 132)
+        _arc_band(surf, color, (c, c - s * .3), s * .42, w, 228, 312)
+        pygame.draw.circle(surf, color, (c, c), s * .11)
+        if name == "eye_off":
+            _stroke(surf, color, [(s * .2, s * .2), (s * .8, s * .8)], w)
+    elif name == "check":
+        _stroke(surf, color, [(s * .24, s * .52), (s * .42, s * .7), (s * .76, s * .32)], w * 1.1)
+    elif name == "trash":
+        _stroke(surf, color, [(s * .2, s * .28), (s * .8, s * .28)], w)
+        _stroke(surf, color, [(s * .4, s * .28), (s * .42, s * .17), (s * .58, s * .17), (s * .6, s * .28)], w * .8)
+        _stroke(surf, color, [(s * .28, s * .34), (s * .32, s * .82), (s * .68, s * .82), (s * .72, s * .34)], w)
+        _stroke(surf, color, [(s * .44, s * .42), (s * .45, s * .72)], w * .7)
+        _stroke(surf, color, [(s * .56, s * .42), (s * .55, s * .72)], w * .7)
+    elif name == "phone":
+        body = pygame.Rect(s * .3, s * .14, s * .4, s * .72)
+        pygame.draw.rect(surf, color, body, int(w), border_radius=int(s * .09))
+        _stroke(surf, color, [(s * .44, s * .76), (s * .56, s * .76)], w * .8)
+    elif name == "shift":
+        pts = [(c, s * .18), (s * .8, s * .5), (s * .62, s * .5), (s * .62, s * .8),
+               (s * .38, s * .8), (s * .38, s * .5), (s * .2, s * .5)]
+        if level:
+            pygame.draw.polygon(surf, color, pts)
+        else:
+            pygame.draw.polygon(surf, color, pts, int(w * .8))
+        if level > 1:  # caps lock: bar under the arrow
+            _stroke(surf, color, [(s * .38, s * .9), (s * .62, s * .9)], w * .8)
+    elif name == "backspace":
+        pts = [(s * .1, c), (s * .32, s * .24), (s * .88, s * .24), (s * .88, s * .76), (s * .32, s * .76)]
+        pygame.draw.polygon(surf, color, pts, int(w * .8))
+        _stroke(surf, color, [(s * .47, s * .38), (s * .71, s * .62)], w * .8)
+        _stroke(surf, color, [(s * .71, s * .38), (s * .47, s * .62)], w * .8)
+    elif name == "camera":
+        body = pygame.Rect(s * .12, s * .3, s * .76, s * .52)
+        pygame.draw.rect(surf, color, body, int(w), border_radius=int(s * .1))
+        pygame.draw.rect(surf, color, (s * .36, s * .2, s * .28, s * .12), border_radius=int(s * .04))
+        pygame.draw.circle(surf, color, (c, s * .56), s * .14, int(w))
+
+
 class CameraApp:
     def __init__(self):
         """Initialize the camera application"""
         PHOTOS_DIR.mkdir(exist_ok=True)
 
         # Camera config - Preview ottimizzato per BOOT VELOCE
-        self.photo_width = 4056
-        self.photo_height = 3040
+        self.photo_width, self.photo_height = SENSOR_SIZE
         # Use higher resolution for better quality, will scale to fit display
         self.preview_width = 640
         self.preview_height = 480
@@ -472,6 +1108,10 @@ class CameraApp:
             self.fb = FramebufferOutput.open(FBDEV_PATH, FBDEV_WAIT)
         if self.fb is not None:
             os.environ["SDL_VIDEODRIVER"] = "dummy"
+            # A previous run killed in standby leaves the output powered down
+            # (reading sysfs costs nothing; sudo runs only in that case).
+            if any(_read_sysfs(p) == "Off" for p in glob.glob("/sys/class/drm/card*-HDMI-*/dpms")):
+                self._set_display_power(True)
 
         # Only the subsystems actually used.  pygame.init() would also spin up
         # mixer/joystick, which cost time and are never touched here.
@@ -531,10 +1171,12 @@ class CameraApp:
             'invert_x': True,
             'invert_y': True
         }
-        
+
         # UI Scaling - MOLTO PIÙ GRANDE per 3.5"
-        # Per 480x320, usiamo scale 1.2 per ingrandire tutto
-        if self.width <= 640:
+        # Per 480x320, usiamo scale 1.2 per ingrandire tutto. Decided by the
+        # height: the 3.5" MPI3508 is driven at 720x480, the same 3:2 shape as
+        # its 480x320 panel (640x480 came out stretched).
+        if self.height <= 480:
             self.scale = 1.2  # Pulsanti grandi
             self.font_size = 28
             self.small_font_size = 22
@@ -546,14 +1188,22 @@ class CameraApp:
         self.button_height = int(60 * self.scale)
         self.button_width = int(150 * self.scale)
         self.margin = int(10 * self.scale)
-        
+
         self.font = load_font(self.font_size)
         self.small_font = load_font(self.small_font_size)
         # Bold for numeric values, micro for tracked-out uppercase labels.
         self.value_font = load_font(self.font_size, bold=True)
         self.small_bold_font = load_font(self.small_font_size, bold=True)
         self.micro_font = load_font(int(self.small_font_size * 0.8))
-        
+        # Menu typography, in pixels
+        self.f_title = ui_font(28, bold=True)
+        self.f_heading = ui_font(23, bold=True)
+        self.f_body = ui_font(19)
+        self.f_body_b = ui_font(19, bold=True)
+        self.f_caption = ui_font(15)
+        self.f_caption_b = ui_font(15, bold=True)
+        self.f_key = ui_font(22, bold=True)
+
         print(f"DEBUG: Screen size: {self.width}x{self.height}, Scale: {self.scale}")
 
         # Camera settings
@@ -570,35 +1220,71 @@ class CameraApp:
         self.mode = "camera"
         self.gallery_index = 0
         self.photos = []
-        self.photo_cache = {}
-        self.thumbnail_queue = queue.Queue()
-        self.loading_paths = set()
         self.last_capture_time = 0
-        self.show_power_popup = False
-        self.show_wifi_popup = False  # NEW: WiFi manager popup
-        self.show_password_popup = False  # NEW: Password input popup
-        self.password_input = ""  # Current password being typed
-        self.password_network = None  # Network waiting for password
-        self.keyboard_shift = False  # Shift key state for uppercase
-        self.wifi_networks = []  # Available networks
-        self.wifi_scroll_offset = 0  # For scrolling network list
-        self.saved_brightness = None
+        self.last_capture_name = None
+        self._capturing = False
         self.standby_mode = False
-        self.hotspot_active = False
+        self._standby_restore = []    # sysfs (path, value) pairs to put back on wake
         self.remote_active = False
         self.remote_last_heartbeat = 0
-        self.shm_sync_counter = 0
-        self.last_shm_sync = 0
         self.grayscale_mode = False
-        self.focus_peaking_mode = False  # Focus peaking overlay
         self.live_exposure_us = None     # Live AE readback (microseconds)
         self.live_gain = None            # Live AE readback (linear gain)
-        
-        # Memoized systemd/NetworkManager probes -> {key: (value, monotonic)}
-        self._status_cache = {}
+
+        # Focus assist: peaking overlay, magnifier and focus meter
+        self.focus_peaking_mode = False
+        self.peak_color_index = 0
+        self.peak_level_index = 1
+        self.zoom_level = 1
+        self.zoom_center = (0.5, 0.5)    # in the full sensor frame, 0..1
+        self.peaker = None               # FocusPeaker, started on first use
+        self._last_peak_submit = 0.0
+        self._meter_value = 0.0
+        self._meter_peak = 0.0
+
+        # Menus: one overlay at a time over the camera or the gallery
+        self.overlay = None              # None, "menu", "wifi", "password", "confirm", "shutdown"
+        self._confirm = None             # what the "confirm" overlay asks
+        self._backdrop = None            # frosted snapshot behind the overlay
+        self._hits = []                  # [(rect, action)] of the last overlay render
+        self._overlay_frame = None       # (signature, rotated surface)
+        self._flash = None               # (rect, until): highlight on the tapped control
+        self._toast = None               # (text, tone, until)
+        self._busy = {}                  # background actions in progress: key -> label
+        self.net = {"server": None, "hotspot": None, "wifi": None, "ip": None}
+        self._net_wake = threading.Event()
+        self._net_thread = None
+        self._hotspot_credentials = None
+        self.hostname = socket.gethostname()
+        self.wifi_networks = []          # Available networks
+        self.wifi_saved = set()          # SSIDs NetworkManager has a profile for
+        self.wifi_page = 0
+        self.wifi_scanning = False
+        self._connecting_ssid = None
+        self._overlay_request = None     # screen switch asked for by a worker thread
+        self._shutdown_text = "Spegnimento…"
+        self.password_input = ""         # Current password being typed
+        self.password_network = None     # Network waiting for password
+        self.password_visible = False
+        self._last_key_time = 0.0
+        self.keyboard_shift = 0          # 0 off, 1 next letter, 2 caps lock
+        self._last_shift_tap = 0.0
+        self.keyboard_symbols = False
+
+        # Gallery: decoded photos (path -> PIL image + caption), small LRU
+        self._gallery_cache = {}
+        self._gallery_lock = threading.Lock()
+        self._gallery_loading = set()
+        self._gallery_frame = None       # (signature, rotated surface)
+        self._gallery_logical = None     # last gallery frame, unrotated (menu backdrop)
+        self._scrims = None
+
         # Rendered-glyph caches for HUD text redrawn every frame
         self._label_cache = {}
         self._text_cache = {}
+        self._icon_cache = {}
+        self._qr_cache = {}
+        self._toolbar_cache = {}
 
         # Preview surface cache & perf optimizations
         self.current_preview_surface = None
@@ -607,29 +1293,29 @@ class CameraApp:
         self._preview_surf = None          # reusable pygame.Surface for the preview area
         self._preview_scaled_size = None   # (new_w, new_h) pre-calculated at setup time
         self._preview_offset = None        # (x_off, y_off) pre-calculated at setup time
-        # Async metadata: updated by a background thread to avoid blocking preview
-        self._meta_lock = threading.Lock()
-        self._meta_thread_running = False
+        self._last_presented = None
         # FPS debug counter
         self._fps_frames = 0
         self._fps_last_t = time.monotonic()
-        
-        # Prepare UDP listener
+        # Web remote: preview JPEG encoder (started on first use) and status file
+        self.remote_writer = None
+        self._last_remote_frame = 0.0
+        self._last_status_write = 0.0
+
+        # Prepare UDP listener. Non-blocking from the start: if the bind fails
+        # (port taken), recvfrom() on a blocking socket would hang the UI.
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
         try:
             # Bind to all interfaces to be sure
             self.sock.bind(('0.0.0.0', UDP_PORT))
-            self.sock.setblocking(False)
             print(f"UDP listener bound to 0.0.0.0:{UDP_PORT}")
         except Exception as e:
             print(f"UDP Bind Error: {e}")
-        
-        # Icons are only drawn by the gallery, so load_icons() runs on first use.
-        self.icons = None
 
         # Setup UI
         self.setup_ui()
-        
+
         # Lazy load non-critical components in background
         print("Starting background initialization...")
         self.battery = None  # Will be initialized in background
@@ -644,11 +1330,15 @@ class CameraApp:
 
         IMPORTANTE: sensor output_size forza il modo full-frame 2x2 binned (IMX477).
         Senza questo, picamera2 sceglie automaticamente un modo croppato per output piccoli.
+
+        Three buffers: picamera2 keeps the latest completed frame aside, so
+        with two the sensor was often left without a free buffer and dropped
+        frames (23 fps measured with peaking on, 30 with three).
         """
         return camera.create_video_configuration(
             main={"size": (self.preview_width, self.preview_height), "format": "RGB888"},
             sensor={"output_size": (2028, 1520)},
-            buffer_count=2
+            buffer_count=3
         )
 
     def _init_camera(self):
@@ -683,7 +1373,7 @@ class CameraApp:
                     # ScalerCrop: garantisce che nessun ritaglio aggiuntivo venga
                     # applicato. Usiamo l'intero sensore 4056x3040.
                     try:
-                        camera.set_controls({"ScalerCrop": (0, 0, 4056, 3040)})
+                        camera.set_controls({"ScalerCrop": (0, 0, *SENSOR_SIZE)})
                     except Exception as e:
                         print(f"ScalerCrop warning: {e}")
                     self.camera = camera
@@ -711,12 +1401,20 @@ class CameraApp:
         except Exception:
             pass
 
-    def _present(self):
-        """Show the composed frame: framebuffer copy, or SDL flip as a fallback."""
+    def _present(self, surface=None):
+        """Show a composed frame: framebuffer copy, or SDL flip as a fallback."""
+        surface = surface or self.screen
         if self.fb is not None:
-            self.fb.show(self.screen)
+            self.fb.show(surface)
         else:
+            if surface is not self.screen:
+                self.screen.blit(surface, (0, 0))
             pygame.display.flip()
+        self._last_presented = surface
+
+    def _present_logical(self, surface):
+        """Present a surface drawn the right way up (the panel is mounted upside down)."""
+        self._present(pygame.transform.rotate(surface, 180))
 
     def _lazy_init(self):
         """Initialize non-critical components in background for faster boot"""
@@ -743,12 +1441,6 @@ class CameraApp:
         # Warm PIL here so the first gallery open / remote frame does not pay
         # the import cost inline.
         _pil_image()
-
-        # Start async metadata reader (updates live ISO/shutter without blocking preview)
-        if not self._meta_thread_running:
-            self._meta_thread_running = True
-            threading.Thread(target=self._meta_reader_thread, daemon=True).start()
-            print("✓ Async metadata reader started")
 
         deadline = time.monotonic() + DEVICE_WAIT
         while pending and time.monotonic() < deadline:
@@ -802,75 +1494,10 @@ class CameraApp:
         self.battery = BatteryManager()
         return True
 
-    def _meta_reader_thread(self):
-        """Background thread: reads camera metadata every ~0.4 s.
-        This avoids blocking the preview loop with capture_metadata()."""
-        # Background init can outrun the camera bring-up; don't spin on None.
-        self._camera_ready.wait()
-        if self.camera is None:
-            return
-        while self._meta_thread_running and self.running:
-            # While the sensor is stalled the main loop owns recovery; a
-            # metadata request would only queue up behind it.
-            if self.camera_stalled_since is None:
-                try:
-                    meta = self.camera.capture_metadata(wait=FRAME_TIMEOUT)
-                    exp  = meta.get("ExposureTime", None)
-                    gain = meta.get("AnalogueGain", None)
-                    with self._meta_lock:
-                        self.live_exposure_us = exp
-                        self.live_gain        = gain
-                except Exception:
-                    pass
-            time.sleep(0.4)
-
-    def load_icons(self):
-        """Load UI icons from assets folder.
-
-        Decoded with PIL (already loaded by picamera2): pygame's own PNG
-        loader lives in pygame.imageext, which is not imported (see top of file).
-        """
-        self.icons = {}
-        assets_path = Path(__file__).parent / "assets"
-        
-        icon_files = {
-            "power": "icon_power.png",
-            "gallery": "icon_gallery.png",
-            "iso": "icon_iso.png",
-            "shutter": "icon_shutter.png",
-            "back": "icon_back.png",
-            "arrow_left": "icon_arrow_left.png",
-            "iso": "icon_iso.png",
-            "shutter": "icon_shutter.png",
-            "back": "icon_back.png",
-            "arrow_left": "icon_arrow_left.png",
-            "arrow_right": "icon_arrow_right.png",
-            "bw": "icon_bw.png" # Optional icon for B/W
-        }
-        
-        for name, filename in icon_files.items():
-            path = assets_path / filename
-            if path.exists():
-                try:
-                    with _pil_image().open(path) as src:
-                        rgba = src.convert("RGBA")
-                    img = pygame.image.frombuffer(rgba.tobytes(), rgba.size,
-                                                  "RGBA").convert_alpha()
-                    # Use smaller fixed icon sizes to prevent stretching
-                    size = 24  # Smaller fixed size for minimal look
-                    scaled = pygame.transform.smoothscale(img, (size, size))
-                    # Make icons white for better visibility (preserves alpha)
-                    scaled.fill((255, 255, 255), special_flags=pygame.BLEND_RGB_ADD)
-                    self.icons[name] = scaled
-                except Exception as e:
-                    print(f"Error loading icon {name}: {e}")
-            else:
-                print(f"Icon not found: {path}")
-
     def trigger_capture(self):
         """GPIO button callback"""
         self.capture_pending = True
-    
+
     def init_touch_input(self):
         """Inizializza input touch diretto via evdev. Returns False to be retried."""
         global evdev
@@ -906,13 +1533,13 @@ class CameraApp:
         except Exception as e:
             print(f"Touch init error: {e}")
         return True
-    
+
     def touch_reader_thread(self):
         """Thread per leggere eventi touch raw"""
         raw_x = 0
         raw_y = 0
         touch_active = False
-        
+
         try:
             for event in self.touch_device.read_loop():
                 if event.type == evdev.ecodes.EV_ABS:
@@ -920,7 +1547,7 @@ class CameraApp:
                         raw_x = event.value
                     elif event.code == evdev.ecodes.ABS_Y:
                         raw_y = event.value
-                        
+
                 elif event.type == evdev.ecodes.EV_KEY:
                     if event.code == evdev.ecodes.BTN_TOUCH:
                         if event.value == 1:  # Touch press
@@ -931,64 +1558,159 @@ class CameraApp:
                                 cal_x, cal_y = self.calibrate_touch(raw_x, raw_y)
                                 self.touch_queue.put(('click', cal_x, cal_y))
                                 touch_active = False
-                                
+
         except Exception as e:
             print(f"Touch reader error: {e}")
 
+    # ---------------- web remote ----------------
+
     def udp_check(self):
-        """Check for UDP commands (non-blocking)"""
+        """Handle commands from the web remote (photo_server.py relays them over UDP)."""
         while True:
             try:
                 data, addr = self.sock.recvfrom(1024)
-                cmd = data.decode('utf-8').strip()
-                print(f"UDP Command: {cmd}")
-                
-                if cmd == "START_REMOTE":
-                    self.remote_active = True
-                    self.remote_last_heartbeat = time.monotonic()
-                elif cmd == "STOP_REMOTE":
-                    self.remote_active = False
-                elif cmd == "HEARTBEAT":
-                    self.remote_last_heartbeat = time.monotonic()
-                elif cmd == "CAPTURE":
-                    self.capture_pending = True
-                elif cmd == "ISO_UP":
-                    self.current_iso_index = (self.current_iso_index + 1) % len(ISO_VALUES)
-                    self.apply_camera_settings()
-                elif cmd == "ISO_DOWN":
-                    self.current_iso_index = (self.current_iso_index - 1) % len(ISO_VALUES)
-                    self.apply_camera_settings()
-                elif cmd == "SHUTTER_UP":
-                    self.current_shutter_index = (self.current_shutter_index + 1) % len(SHUTTER_SPEEDS)
-                    self.apply_camera_settings()
-                elif cmd == "SHUTTER_DOWN":
-                    self.current_shutter_index = (self.current_shutter_index - 1) % len(SHUTTER_SPEEDS)
-                    self.apply_camera_settings()
-                elif cmd == "BW":
-                    # Placeholder for BW command action
-                    pass
             except BlockingIOError:
                 break
-            except Exception as e:
+            except OSError as e:
                 print(f"UDP Error: {e}")
                 break
-        
+            try:
+                self._handle_command(data.decode("utf-8", "replace").strip())
+            except Exception as e:
+                print(f"UDP command error: {e}")
+
+    def _handle_command(self, cmd):
+        name, _, arg = cmd.partition(" ")
+        now = time.monotonic()
+        if name in ("START_REMOTE", "HEARTBEAT", "STREAM"):
+            # STREAM: an MJPEG client is connected and needs preview frames.
+            if not self.remote_active:
+                print(f"Remote connected ({name})")
+            self.remote_active = True
+            self.remote_last_heartbeat = now
+            return
+        print(f"UDP Command: {cmd}")
+        if name == "STOP_REMOTE":
+            self.remote_active = False
+        elif name == "WAKE":
+            self.wake_from_standby()
+        elif name == "STANDBY":
+            self._close_overlay()
+            self.enter_standby()
+        elif name == "CAPTURE":
+            self.capture_pending = True
+        elif name in ("ISO_UP", "ISO_DOWN", "ISO"):
+            step = {"ISO_UP": 1, "ISO_DOWN": -1}.get(name)
+            if step:
+                self.current_iso_index = (self.current_iso_index + step) % len(ISO_VALUES)
+            elif arg.isdigit() and int(arg) < len(ISO_VALUES):
+                self.current_iso_index = int(arg)
+            self.apply_camera_settings()
+        elif name in ("SHUTTER_UP", "SHUTTER_DOWN", "SHUTTER"):
+            step = {"SHUTTER_UP": 1, "SHUTTER_DOWN": -1}.get(name)
+            if step:
+                self.current_shutter_index = (self.current_shutter_index + step) % len(SHUTTER_SPEEDS)
+            elif arg.isdigit() and int(arg) < len(SHUTTER_SPEEDS):
+                self.current_shutter_index = int(arg)
+            self.apply_camera_settings()
+        elif name == "BW":
+            self.grayscale_mode = (arg == "1") if arg in ("0", "1") else not self.grayscale_mode
+            self.apply_camera_settings()
+        elif name == "PEAK":
+            self.set_focus_assist((arg == "1") if arg in ("0", "1") else not self.focus_peaking_mode)
+        elif name == "ZOOM":
+            if arg.isdigit() and int(arg) in ZOOM_LEVELS:
+                self._set_zoom(int(arg))
+            else:
+                self._cycle_zoom()
+        elif name == "ZOOM_AT":
+            try:
+                u, v = (float(p) for p in arg.split())
+            except ValueError:
+                return
+            self._zoom_at(min(max(u, 0.0), 1.0), min(max(v, 0.0), 1.0))
+        else:
+            print(f"Unknown command: {cmd}")
+
+    def _status_snapshot(self):
+        if self.standby_mode:
+            state = "standby"
+        elif self.camera_stalled_since is not None:
+            state = "stalled"
+        else:
+            state = "active"
+        battery = None
+        if self.battery and self.battery.available:
+            battery = int(self.battery.percentage)
+        meter = None
+        if self.focus_peaking_mode and self._meter_peak > 0:
+            meter = round(min(1.0, self._meter_value / self._meter_peak), 3)
+        return {
+            "t": time.time(),
+            "status": state,
+            "mode": "remote" if self.remote_active else "local",
+            "iso": str(ISO_VALUES[self.current_iso_index]),
+            "iso_index": self.current_iso_index,
+            "iso_values": [str(v) for v in ISO_VALUES],
+            "shutter": SHUTTER_SPEEDS[self.current_shutter_index][0],
+            "shutter_index": self.current_shutter_index,
+            "shutter_values": [name for name, _ in SHUTTER_SPEEDS],
+            "live_shutter": self._live_shutter_text(),
+            "live_iso": int(self.live_gain * 100) if self.live_gain else None,
+            "bw": self.grayscale_mode,
+            "peaking": self.focus_peaking_mode,
+            "zoom": self.zoom_level,
+            "focus": meter,
+            "battery": battery,
+            "capturing": self._capturing,
+            "last_capture": self.last_capture_name,
+            "photos": len(self.photos),
+        }
+
+    def _write_status(self):
+        """Publish the settings for photo_server.py (atomic replace, ~0.2 ms)."""
+        self._last_status_write = time.monotonic()
+        try:
+            tmp = f"{SHARED_MEM_STATUS}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(self._status_snapshot(), f)
+            os.replace(tmp, SHARED_MEM_STATUS)
+        except Exception as e:
+            print(f"Status write error: {e}")
+
+    def _feed_remote(self, frame):
+        """Hand a preview frame to the JPEG encoder while a remote is watching."""
+        if not self.remote_active:
+            return
+        now = time.monotonic()
+        if now - self._last_remote_frame < 1.0 / REMOTE_FPS:
+            return
+        self._last_remote_frame = now
+        if self.remote_writer is None:
+            self.remote_writer = RemotePreviewWriter(SHARED_MEM_PREVIEW)
+        self.remote_writer.submit(frame)
+
+    # ---------------- layout ----------------
+
     def setup_ui(self):
         """Setup UI - SIDEBARS LAYOUT"""
-        # Define sidebar width
-        self.sidebar_width = int(70 * self.scale)
-        
+        # Define sidebar width. On screens wider than 4:3 the sidebars take
+        # the extra width, so the 4:3 image keeps letterbox bars of ~40 px for
+        # the toasts above it and the focus toolbar below.
+        self.sidebar_width = max(int(70 * self.scale),
+                                 (self.width - int(self.height * 0.83) * 4 // 3) // 2)
+
         # Left sidebar rect
         self.left_bar_rect = pygame.Rect(0, 0, self.sidebar_width, self.height)
-        
+
         # Right sidebar rect
         self.right_bar_rect = pygame.Rect(self.width - self.sidebar_width, 0, self.sidebar_width, self.height)
-        
+
         # Preview Rect - Central area between sidebars
         # Available width for preview
         preview_w = self.width - (2 * self.sidebar_width)
         self.preview_rect = pygame.Rect(self.sidebar_width, 0, preview_w, self.height)
-        
+
         print(f"DEBUG: Preview Rect: {self.preview_rect}")
 
         # --- Pre-allocate preview rendering resources ---
@@ -1004,6 +1726,11 @@ class CameraApp:
             (self.preview_rect.width  - new_w) // 2,
             (self.preview_rect.height - new_h) // 2,
         )
+        # The image itself; the letterbox bars above and below it hold the
+        # toasts and the focus-assist toolbar.
+        self.image_rect = pygame.Rect(self.preview_rect.x + self._preview_offset[0],
+                                      self.preview_rect.y + self._preview_offset[1],
+                                      new_w, new_h)
         # Single reusable surface for the preview area (BLACK background)
         self._preview_surf = pygame.Surface(
             (self.preview_rect.width, self.preview_rect.height)
@@ -1021,196 +1748,229 @@ class CameraApp:
         # Button Radius
         radius = 30
         self.btn_radius = radius
-        
+
         # Centers for Left Sidebar Buttons
         # SHUTTER TOP (25%), ISO BOTTOM (75%)
         left_center_x = self.sidebar_width // 2
-        
+
         self.shutter_center = (left_center_x, int(self.height * 0.25))
         self.iso_center = (left_center_x, int(self.height * 0.75))
-        
+
         # Arrow Rects for Touch Detection
         arrow_size = int(40 * self.scale)
         half_arrow = arrow_size // 2
-        
+
         # Shutter Arrows (Top)
         self.shutter_up_rect = pygame.Rect(self.shutter_center[0] - half_arrow, self.shutter_center[1] - 70, arrow_size, arrow_size)
         self.shutter_down_rect = pygame.Rect(self.shutter_center[0] - half_arrow, self.shutter_center[1] + 55, arrow_size, arrow_size)
-        
+
         # ISO Arrows (Bottom)
         self.iso_up_rect = pygame.Rect(self.iso_center[0] - half_arrow, self.iso_center[1] - 70, arrow_size, arrow_size)
         self.iso_down_rect = pygame.Rect(self.iso_center[0] - half_arrow, self.iso_center[1] + 55, arrow_size, arrow_size)
-        
+
         # Centers for Right Sidebar Buttons
         # Power, Gallery, B/W, Focus Peaking - 4 equally distributed
         right_center_x = self.width - (self.sidebar_width // 2)
-        
+
         self.power_center   = (right_center_x, int(self.height * 0.125))
         self.gallery_center = (right_center_x, int(self.height * 0.375))
         self.bw_center      = (right_center_x, int(self.height * 0.625))
         self.fp_center      = (right_center_x, int(self.height * 0.875))  # Focus Peaking
-        
+
         # Button Rects for Right Sidebar
         btn_touch_size = int(60 * self.scale)
         self.power_rect = pygame.Rect(0, 0, btn_touch_size, btn_touch_size)
         self.power_rect.center = self.power_center
-        
+
         self.gallery_rect = pygame.Rect(0, 0, btn_touch_size, btn_touch_size)
         self.gallery_rect.center = self.gallery_center
-        
+
         self.bw_rect = pygame.Rect(0, 0, btn_touch_size, btn_touch_size)
         self.bw_rect.center = self.bw_center
-        
+
         self.fp_rect = pygame.Rect(0, 0, btn_touch_size, btn_touch_size)
         self.fp_rect.center = self.fp_center
-        
-        # Popup power menu
-        popup_width = int(self.width * 0.90)  # Wider popup (90%)
-        popup_height = int(self.height * 0.90) # Taller popup (90%)
-        popup_x = (self.width - popup_width) // 2
-        popup_y = (self.height - popup_height) // 2
-        self.popup_rect = pygame.Rect(popup_x, popup_y, popup_width, popup_height)
-        
-        # Custom sizes for MAXIMIZED buttons
-        btn_width = int(popup_width * 0.45)
-        btn_height = int(68 * self.scale) # Optimized Height (68px) to fit text
-        btn_spacing_x = int(15 * self.scale)
-        btn_spacing_y = int(8 * self.scale) # Minimal vertical spacing
-        
-        # Grid layout for popup buttons (now 3 rows)
-        start_x = popup_x + (popup_width - (2 * btn_width + btn_spacing_x)) // 2
-        start_y = popup_y + 35 # Reduced top margin to fit huge buttons
-        
-        # Popup power menu - Row 1
-        self.popup_shutdown_btn = pygame.Rect(start_x, start_y, btn_width, btn_height)
-        self.popup_standby_btn = pygame.Rect(start_x + btn_width + btn_spacing_x, start_y, btn_width, btn_height)
-        
-        # Row 2
-        self.popup_server_btn = pygame.Rect(start_x, start_y + btn_height + btn_spacing_y, btn_width, btn_height)
-        self.popup_hotspot_btn = pygame.Rect(start_x + btn_width + btn_spacing_x, start_y + btn_height + btn_spacing_y, btn_width, btn_height)
-        
-        # Row 3 - WiFi Manager
-        self.popup_wifi_btn = pygame.Rect(start_x, start_y + 2 * (btn_height + btn_spacing_y), btn_width, btn_height)
-        
-        # Cancel button at bottom
-        self.popup_cancel_btn = pygame.Rect(popup_x + (popup_width - btn_width) // 2, 
-                                             popup_y + popup_height - int(45 * self.scale) - 10, btn_width, int(40 * self.scale))
-        
-        # Back button per gallery
-        self.back_btn_rect = pygame.Rect(10, 10, 80, 60)
-        
-        # Trash button per gallery (Top Right)
-        self.trash_btn_rect = pygame.Rect(self.width - 90, 10, 80, 60)
 
-    def _cached_status(self, key, probe, ttl=3.0):
-        """Memoize a subprocess-backed status probe.
+        self._layout_focus_toolbar()
 
-        draw_power_popup() runs every frame while the menu is open, so probing
-        systemd and NetworkManager directly meant spawning ~60 processes per
-        second on a Pi Zero.
+        # Gallery: round buttons over the photo
+        self.back_btn_rect = pygame.Rect(14, 14, 56, 56)
+        self.trash_btn_rect = pygame.Rect(self.width - 70, 14, 56, 56)
+
+    def _layout_focus_toolbar(self):
+        """Focus-assist toolbar: in the letterbox bar under the image, or over its bottom edge."""
+        img = self.image_rect
+        below = self.preview_rect.bottom - img.bottom
+        self._toolbar_floating = below < 36
+        if self._toolbar_floating:
+            bar = pygame.Rect(img.x, img.bottom - 52, img.w, 52)
+        else:
+            bar = pygame.Rect(img.x, img.bottom, img.w, below)
+        h = min(46, bar.h - 6)
+        y = bar.centery - h // 2
+        pad, gap = 8, 8
+        zoom = pygame.Rect(bar.x + pad, y, 76, h)
+        level = pygame.Rect(bar.right - pad - 62, y, 62, h)
+        color = pygame.Rect(level.x - gap - 52, y, 52, h)
+        meter = pygame.Rect(zoom.right + gap, y, color.x - gap - zoom.right - gap, h)
+        self.toolbar = {"bar": bar, "zoom": zoom, "meter": meter, "color": color, "level": level}
+
+    # ---------------- network & system (background) ----------------
+
+    def _start_net_monitor(self):
+        """Poll server / hotspot / Wi-Fi state while a menu is open.
+
+        Probing from the drawing code meant spawning systemctl and nmcli in the
+        middle of a frame; this thread refreshes self.net every few seconds,
+        or at once after an action (self._net_wake).
         """
-        now = time.monotonic()
-        value, stamp = self._status_cache.get(key, (None, 0.0))
-        if value is None or now - stamp > ttl:
-            value = probe()
-            self._status_cache[key] = (value, now)
-        return value
+        if self._net_thread is not None and self._net_thread.is_alive():
+            self._net_wake.set()
+            return
+        self._net_thread = threading.Thread(target=self._net_monitor, daemon=True)
+        self._net_thread.start()
 
-    def _invalidate_status(self, key):
-        self._status_cache.pop(key, None)
+    def _net_monitor(self):
+        while self.running and self.overlay is not None and not self.standby_mode:
+            self._probe_network()
+            self._net_wake.wait(timeout=3.0)
+            self._net_wake.clear()
 
-    def check_server_status(self):
-        """Check if photo server is running"""
-        def probe():
+    def _probe_network(self):
+        code, out = _run_quiet(['systemctl', 'is-active', 'photo-server'], timeout=3)
+        server = out.strip() == "active"
+        code, out = _run_quiet(['nmcli', '-t', '-f', 'NAME,TYPE', 'con', 'show', '--active'], timeout=3)
+        hotspot, wifi = False, None
+        for line in out.splitlines():
+            fields = _nmcli_fields(line)
+            if len(fields) < 2:
+                continue
+            if fields[0] == HOTSPOT_CONNECTION:
+                hotspot = True
+            elif fields[1] == "802-11-wireless" and wifi is None:
+                wifi = fields[0]
+        if wifi == "preconfigured":
+            # Raspberry Pi Imager names the Wi-Fi it sets up "preconfigured"
+            code, out = _run_quiet(['nmcli', '-t', '-g', '802-11-wireless.ssid',
+                                    'con', 'show', 'preconfigured'], timeout=3)
+            wifi = out.strip() or wifi
+        if hotspot and self._hotspot_credentials is None:
+            code, out = _run_quiet(['sudo', '-n', 'nmcli', '-s', '-t', '-g',
+                                    '802-11-wireless.ssid,802-11-wireless-security.psk',
+                                    'con', 'show', HOTSPOT_CONNECTION], timeout=3)
+            lines = out.splitlines()
+            if code == 0 and len(lines) >= 2 and lines[0]:
+                self._hotspot_credentials = (lines[0], lines[1])
+        self.net = {"server": server, "hotspot": hotspot, "wifi": wifi,
+                    "ip": HOTSPOT_IP if hotspot else _local_ip()}
+
+    def _run_background(self, key, label, fn):
+        """Run a slow action (systemctl, nmcli) off the UI thread, shown as busy."""
+        if key in self._busy:
+            return
+        self._busy[key] = label
+
+        def worker():
             try:
-                status = subprocess.run(['systemctl', 'is-active', 'photo-server'],
-                                       capture_output=True, text=True, timeout=3).stdout.strip()
-                return status == 'active'
-            except:
-                return False
-        return self._cached_status('server', probe)
+                fn()
+            except Exception as e:
+                print(f"{key} failed: {e}")
+                self._show_toast("Operazione non riuscita", "danger")
+            finally:
+                self._busy.pop(key, None)
+                self._probe_network()
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def toggle_server(self):
-        """Toggle photo server"""
-        if self.check_server_status():
-            subprocess.run(['sudo', 'systemctl', 'stop', 'photo-server'])
-        else:
-            subprocess.run(['sudo', 'systemctl', 'start', 'photo-server'])
-        self._invalidate_status('server')
+        """Start or stop the web server (photo_server.py)."""
+        start = not self.net.get("server")
 
-    def check_hotspot_status(self):
-        """Check if hotspot is active"""
-        def probe():
-            try:
-                status = subprocess.run(['nmcli', '-t', '-f', 'ACTIVE,NAME', 'con', 'show'],
-                                       capture_output=True, text=True, timeout=3).stdout
-                return "yes:RaspiCam_Hotspot" in status
-            except:
-                return False
-        return self._cached_status('hotspot', probe)
+        def run():
+            code, out = _run_quiet(['sudo', 'systemctl', 'start' if start else 'stop',
+                                    'photo-server'], timeout=20)
+            if code == 0:
+                self._show_toast("Server web avviato" if start else "Server web fermato",
+                                 "success" if start else "info")
+            else:
+                self._show_toast("Il server web non risponde", "danger")
+        self._run_background("server", "Avvio…" if start else "Arresto…", run)
 
     def toggle_hotspot(self):
-        """Toggle hotspot"""
-        if self.check_hotspot_status():
-            subprocess.run(['sudo', 'nmcli', 'con', 'down', 'RaspiCam_Hotspot'])
-        else:
-            subprocess.run(['sudo', 'nmcli', 'con', 'up', 'RaspiCam_Hotspot'])
-        self._invalidate_status('hotspot')
+        """Bring the hotspot profile up or down."""
+        start = not self.net.get("hotspot")
 
+        def run():
+            code, out = _run_quiet(['sudo', 'nmcli', 'con', 'up' if start else 'down',
+                                    HOTSPOT_CONNECTION], timeout=40)
+            if code == 0:
+                self._show_toast("Hotspot attivo" if start else "Hotspot spento",
+                                 "success" if start else "info")
+            else:
+                self._show_toast("Hotspot non disponibile", "danger")
+        self._run_background("hotspot", "Attivazione…" if start else "Spegnimento…", run)
 
     def scan_wifi_networks(self):
-        """Scan for available WiFi networks"""
-        try:
-            # Rescan networks
-            subprocess.run(['sudo', 'nmcli', 'device', 'wifi', 'rescan'], 
-                          capture_output=True, timeout=5)
-            time.sleep(1)  # Wait for scan to complete
-            
-            # Get list of networks
-            result = subprocess.run(['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY', 'device', 'wifi', 'list'],
-                                   capture_output=True, text=True, timeout=5)
-            
-            networks = []
-            for line in result.stdout.strip().split('\n'):
-                if line:
-                    parts = line.split(':')
-                    if len(parts) >= 3 and parts[0]:  # Skip empty SSIDs
-                        ssid = parts[0]
-                        signal = int(parts[1]) if parts[1].isdigit() else 0
-                        security = parts[2] if parts[2] else 'Open'
-                        networks.append({'ssid': ssid, 'signal': signal, 'security': security})
-            
-            # Sort by signal strength
-            networks.sort(key=lambda x: x['signal'], reverse=True)
-            self.wifi_networks = networks[:10]  # Keep top 10
-            print(f"Found {len(self.wifi_networks)} WiFi networks")
-            
-        except Exception as e:
-            print(f"WiFi scan error: {e}")
-            self.wifi_networks = []
-    
+        """Scan for Wi-Fi networks in the background (results in self.wifi_networks)."""
+        if self.wifi_scanning:
+            return
+        self.wifi_scanning = True
+
+        def run():
+            try:
+                _run_quiet(['sudo', 'nmcli', 'device', 'wifi', 'rescan'], timeout=8)
+                time.sleep(1)  # Wait for scan to complete
+                code, out = _run_quiet(['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY',
+                                        'device', 'wifi', 'list'], timeout=8)
+                best = {}
+                for line in out.splitlines():
+                    fields = _nmcli_fields(line)
+                    if len(fields) < 3 or not fields[0]:
+                        continue  # Skip hidden networks
+                    signal = int(fields[1]) if fields[1].isdigit() else 0
+                    net = {'ssid': fields[0], 'signal': signal,
+                           'security': fields[2] if fields[2] not in ('', '--') else 'Open'}
+                    # One row per SSID (strongest access point)
+                    if net['ssid'] not in best or signal > best[net['ssid']]['signal']:
+                        best[net['ssid']] = net
+                networks = sorted(best.values(), key=lambda n: n['signal'], reverse=True)
+                # Profiles NetworkManager already has: these connect without
+                # asking for the password again (named after their SSID,
+                # except Raspberry Pi Imager's "preconfigured").
+                code, out = _run_quiet(['nmcli', '-t', '-f', 'NAME,TYPE', 'con', 'show'], timeout=5)
+                saved = {f[0] for f in map(_nmcli_fields, out.splitlines())
+                         if len(f) >= 2 and f[1] == "802-11-wireless" and f[0] != HOTSPOT_CONNECTION}
+                if self.net.get("wifi"):
+                    saved.add(self.net["wifi"])
+                self.wifi_saved = saved
+                self.wifi_networks = networks[:15]
+                self.wifi_page = 0
+                print(f"Found {len(self.wifi_networks)} WiFi networks")
+            finally:
+                self.wifi_scanning = False
+        threading.Thread(target=run, daemon=True).start()
+
     def connect_to_wifi(self, ssid, password=None):
-        """Connect to a WiFi network"""
-        try:
+        """Connect to a Wi-Fi network in the background; reports with a toast."""
+        def run():
+            cmd = ['sudo', 'nmcli', 'device', 'wifi', 'connect', ssid]
             if password:
-                # Connect with password
-                result = subprocess.run(['sudo', 'nmcli', 'device', 'wifi', 'connect', ssid, 
-                                       'password', password],
-                                      capture_output=True, text=True, timeout=15)
-            else:
-                # Connect to open network
-                result = subprocess.run(['sudo', 'nmcli', 'device', 'wifi', 'connect', ssid],
-                                      capture_output=True, text=True, timeout=15)
-            
-            if result.returncode == 0:
+                cmd += ['password', password]
+            code, out = _run_quiet(cmd, timeout=30)
+            if code == 0:
                 print(f"✓ Connected to {ssid}")
-                return True
-                print(f"Connection failed: {result.stderr}")
-                return False
-                
-        except Exception as e:
-            print(f"WiFi connect error: {e}")
-            return False
+                self._show_toast(f"Connessa a {ssid}", "success")
+                self.password_input = ""
+                # Back to the menu; screens are switched by the main loop
+                self._overlay_request = "menu"
+            else:
+                print(f"Connection failed: {out.strip()}")
+                self._show_toast("Connessione non riuscita: controlla la password"
+                                 if password else "Connessione non riuscita", "danger")
+        self._run_background("wifi", "Connessione…", run)
+
+    def _show_toast(self, text, tone="info", seconds=2.6):
+        self._toast = (text, tone, time.monotonic() + seconds)
 
     def delete_photo(self):
         """Delete current photo in gallery"""
@@ -1220,269 +1980,248 @@ class CameraApp:
         try:
             # Get current photo path
             photo_path = self.photos[self.gallery_index]
-            
+
             # Delete file
             os.remove(photo_path)
             print(f"Deleted photo: {photo_path}")
-            
+
             # Remove from list
             self.photos.pop(self.gallery_index)
-            
+
             # Remove from cache if present
-            if str(photo_path) in self.photo_cache:
-                del self.photo_cache[str(photo_path)]
-            
+            with self._gallery_lock:
+                self._gallery_cache.pop(photo_path, None)
+
             # Adjust index
             if self.gallery_index >= len(self.photos):
                 self.gallery_index = len(self.photos) - 1
             if self.gallery_index < 0:
                 self.gallery_index = 0
-                
+            self._show_toast("Foto eliminata", "info")
+
         except Exception as e:
             print(f"Error deleting photo: {e}")
+            self._show_toast("Impossibile eliminare la foto", "danger")
+
+    # ---------------- standby ----------------
+
+    def _set_display_power(self, on):
+        """Switch the video output (and any sysfs backlight) on or off.
+
+        fbN/blank powers the CRTC down through the KMS driver, so the HDMI
+        signal stops. Panels with a backlight device (DSI, SPI) are switched
+        through it too. HDMI panels such as the MPI3508 keep their own
+        backlight lit without a signal: only their key turns it off.
+        """
+        fb = os.path.basename(FBDEV_PATH)
+        writes = [(f"/sys/class/graphics/{fb}/blank", 0 if on else 4)]
+        writes += [(f"{bl}/bl_power", 0 if on else 4) for bl in glob.glob("/sys/class/backlight/*")]
+        _write_sysfs(writes)
 
     def enter_standby(self):
-        """Enter real low-power standby by writing to /sys/power/state.
-        Tries 'mem' (S3 sleep) first, then 'freeze' (lighter suspend).
-        The process blocks until the Pi wakes; wake_from_standby() is then
-        called automatically."""
-        print("Entering standby (suspend)...")
+        """Display off, sensor stopped, CPU slowed down; network and web server stay up.
+
+        Raspberry Pi kernels support no system sleep state (/sys/power/state is
+        empty), so this is as deep as it goes. The web server and the hotspot
+        keep running, so photos can still be downloaded and the page can wake
+        the camera; the old version stopped the server and never restarted it.
+        Wake with a touch, the shutter button or the web remote.
+        """
+        if self.standby_mode or self.camera is None:
+            return
+        print("Entering standby...")
+        self._close_overlay()
         self.standby_mode = True
-
         try:
-            # 0. Turn off heavy services
-            if self.check_server_status():
-                print("Stopping photo server...")
-                subprocess.run(['sudo', 'systemctl', 'stop', 'photo-server'])
-            if self.check_hotspot_status():
-                print("Stopping hotspot...")
-                subprocess.run(['sudo', 'nmcli', 'con', 'down', 'RaspiCam_Hotspot'])
-
-            # 1. Stop camera to release hardware
-            try:
-                self.camera.stop()
-                print("✓ Camera stopped")
-            except Exception as e:
-                print(f"Camera stop warning: {e}")
-
-            # 2. Turn off LCD backlight
-            subprocess.run(['sudo', 'sh', '-c', 'echo 0 > /sys/class/backlight/*/brightness'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(['sudo', 'sh', '-c', 'echo 1 > /sys/class/backlight/*/bl_power'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(['sudo', 'sh', '-c', 'echo 18 > /sys/class/gpio/export'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(['sudo', 'sh', '-c', 'echo out > /sys/class/gpio/gpio18/direction'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(['sudo', 'sh', '-c', 'echo 0 > /sys/class/gpio/gpio18/value'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            # For HDMI/DSI displays
-            subprocess.run(['sudo', 'vcgencmd', 'display_power', '0'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print("✓ LCD backlight off")
-
-            # 3. Blank framebuffer
-            subprocess.run(['sudo', 'sh', '-c', 'echo 1 > /sys/class/graphics/fb1/blank'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(['sudo', 'sh', '-c', 'echo 1 > /sys/class/graphics/fb0/blank'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            # 4. Black screen and short pause
-            self.screen.fill((0, 0, 0))
-            self._present()
-            time.sleep(0.3)
-
-            # 5. Write to /sys/power/state — this BLOCKS until the Pi wakes up.
-            #    Try 'mem' (S3/S2 real sleep) first; fallback to 'freeze'.
-            suspended = False
-            for sleep_state in ('mem', 'freeze'):
-                print(f"💤 Trying suspend state: {sleep_state}")
-                result = subprocess.run(
-                    ['sudo', 'sh', '-c', f'echo {sleep_state} > /sys/power/state'],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-                )
-                if result.returncode == 0:
-                    # We reach here only AFTER the Pi has woken up
-                    print(f"☀ Resumed from '{sleep_state}' suspend")
-                    suspended = True
-                    break
-                else:
-                    err = result.stderr.decode().strip()
-                    print(f"'{sleep_state}' not supported: {err}")
-
-            if not suspended:
-                # Hardware doesn't support any sleep state — stay in display-off mode
-                print("⚠ Suspend not supported: staying in display-off standby")
-                subprocess.run(['sudo', 'sh', '-c', 'cpufreq-set -g powersave'],
-                              check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                # standby_mode stays True; wake on next touch
-                return
-
-            self.wake_from_standby()
-
+            # Pending requests would make stop() wait for a frame
+            self.camera.cancel_all_and_flush()
+            self.camera.stop()
+            print("✓ Camera stopped")
         except Exception as e:
-            print(f"Standby error: {e}")
+            print(f"Camera stop warning: {e}")
 
+        # Black frame first, in case the output cannot be switched off
+        self.screen.fill(BLACK)
+        self._present()
+
+        restore, writes = [], []
+        governor = _read_sysfs(CPUFREQ_GOVERNOR)
+        if governor and governor != "powersave":
+            restore.append((CPUFREQ_GOVERNOR, governor))
+            writes.append((CPUFREQ_GOVERNOR, "powersave"))
+        trigger = _read_sysfs(f"{ACT_LED}/trigger")
+        if trigger and "[" in trigger and "timer" in trigger:
+            current = trigger.split("[", 1)[1].split("]", 1)[0]
+            restore.append((f"{ACT_LED}/trigger", current))
+            # The timer trigger creates delay_on/delay_off when it is selected
+            writes.append((f"{ACT_LED}/trigger", "timer"))
+        _write_sysfs(writes)
+        if any(path.endswith("trigger") for path, _ in writes):
+            _write_sysfs([(f"{ACT_LED}/delay_on", 80), (f"{ACT_LED}/delay_off", 2920)])
+        self._standby_restore = restore
+        self._set_display_power(False)
+        self._write_status()
+        print("💤 Standby (display off, sensor stopped)")
 
     def wake_from_standby(self):
-        """Restore display and camera after waking from standby."""
+        """Restore display and camera after standby."""
         if not self.standby_mode:
             return
-
         print("Waking from standby...")
-
+        # CPU speed first, so the rest runs at full clock
+        _write_sysfs(self._standby_restore)
+        self._standby_restore = []
+        self._set_display_power(True)
         try:
-            # Restore LCD backlight
-            subprocess.run(['sudo', 'sh', '-c', 'echo 255 > /sys/class/backlight/*/brightness'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(['sudo', 'sh', '-c', 'echo 0 > /sys/class/backlight/*/bl_power'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(['sudo', 'sh', '-c', 'echo 1 > /sys/class/gpio/gpio18/value'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(['sudo', 'sh', '-c', 'echo 18 > /sys/class/gpio/unexport'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            # For HDMI/DSI displays
-            subprocess.run(['sudo', 'vcgencmd', 'display_power', '1'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print("✓ LCD backlight on")
-
-            # Unblank framebuffer
-            subprocess.run(['sudo', 'sh', '-c', 'echo 0 > /sys/class/graphics/fb1/blank'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(['sudo', 'sh', '-c', 'echo 0 > /sys/class/graphics/fb0/blank'], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            # Restore CPU governor
-            subprocess.run(['sudo', 'cpufreq-set', '-g', 'ondemand'], check=False,
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            # Re-enable LED
-            subprocess.run(['sudo', 'sh', '-c',
-                          'echo 1 > /sys/class/leds/led0/brightness'], check=False,
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            # Restart camera
-            self.camera.configure(self._preview_config(self.camera))
-            self.camera.start()
-            try:
-                self.camera.set_controls({"ScalerCrop": (0, 0, 4056, 3040)})
-            except Exception:
-                pass
+            self._restart_preview()
             print("✓ Camera restarted")
-
-            self.standby_mode = False
-            self.saved_brightness = None
-            print("✓ Wake complete")
-
         except Exception as e:
             print(f"Wake error: {e}")
-            try:
-                self.camera.start()
-            except Exception:
-                pass
-            self.standby_mode = False
-            self.saved_brightness = None
+            # The stall recovery in _capture_preview_frame keeps retrying
+            self.camera_stalled_since = time.monotonic()
+        self.standby_mode = False
+        self._last_presented = None
+        self._write_status()
+        print("✓ Wake complete")
 
+    # ---------------- camera control ----------------
+
+    def _scaler_crop(self):
+        """ScalerCrop for the magnifier: a 4:3 window around zoom_center."""
+        sw, sh = SENSOR_SIZE
+        if self.zoom_level <= 1:
+            return (0, 0, sw, sh)
+        w = int(sw / self.zoom_level) & ~1
+        h = int(sh / self.zoom_level) & ~1
+        cx, cy = self.zoom_center
+        x = int(min(max(cx * sw - w / 2, 0), sw - w)) & ~1
+        y = int(min(max(cy * sh - h / 2, 0), sh - h)) & ~1
+        return (x, y, w, h)
 
     def apply_camera_settings(self):
-        """Apply ISO and shutter settings"""
+        """Send ISO, shutter, B/W, anti-flicker and the magnifier crop in one call.
+
+        A value of 0 for ExposureTime / AnalogueGain hands it back to the AE
+        algorithm (picamera2 switches ExposureTimeMode / AnalogueGainMode). So
+        a manual ISO with an automatic shutter now still adapts the exposure
+        time; AeEnable=False used to freeze both.
+        """
+        if self.camera is None:
+            return
         iso = ISO_VALUES[self.current_iso_index]
         shutter_name, shutter_us = SHUTTER_SPEEDS[self.current_shutter_index]
-        
-        if iso == "Auto":
-            self.camera.set_controls({"AeEnable": True})
-        else:
-            self.camera.set_controls({"AeEnable": False})
-            self.camera.set_controls({"AnalogueGain": iso / 100.0})
-        
-        if shutter_us > 0:
-            requested_fps = 1000000.0 / shutter_us
-            if requested_fps < 30.0:
-                self.camera.set_controls({"FrameRate": (0.1, requested_fps)})
-            else:
-                self.camera.set_controls({"FrameRate": (30.0, 30.0)})
-            self.camera.set_controls({"ExposureTime": shutter_us})
-        else:
-            self.camera.set_controls({"FrameRate": (30.0, 30.0)})
-            # We don't disable Ae unless iso is manual, so handled above
-            
-        # Apply B/W effect
+        controls = {
+            "AnalogueGain": 0.0 if iso == "Auto" else iso / 100.0,
+            "ExposureTime": shutter_us,
+            "Saturation": 0.0 if self.grayscale_mode else 1.0,
+            "ScalerCrop": self._scaler_crop(),
+        }
+        # Slow shutters need a longer frame time
+        requested_fps = 1000000.0 / shutter_us if shutter_us > 0 else 30.0
+        controls["FrameRate"] = (0.1, requested_fps) if requested_fps < 30.0 else (30.0, 30.0)
+        # Anti-flicker 50 Hz (libcamera 0.5+ replaced AePowerLineFrequency)
+        available = self.camera.camera_controls
+        if "AeFlickerMode" in available and "AeFlickerPeriod" in available:
+            controls["AeFlickerMode"] = 1    # FlickerManual
+            controls["AeFlickerPeriod"] = 10000
+        elif "AePowerLineFrequency" in available:
+            controls["AePowerLineFrequency"] = 1
+        unsupported = [k for k in controls if k != "FrameRate" and k not in available]
+        for key in unsupported:
+            controls.pop(key)
         try:
-            if self.grayscale_mode:
-                self.camera.set_controls({"Saturation": 0.0})
-            else:
-                self.camera.set_controls({"Saturation": 1.0})
+            self.camera.set_controls(controls)
         except Exception as e:
-            print(f"Warning: Could not set Saturation: {e}")
-            
-        # Anti-flicker 50Hz
-        try:
-            self.camera.set_controls({"AePowerLineFrequency": 1})
-        except Exception as e:
-            print(f"Warning: Could not set AePowerLineFrequency: {e}")
-            
+            print(f"Warning: could not apply camera settings: {e}")
+
+    def _restart_preview(self, flush=False):
+        """(Re)configure and start the preview stream with the current settings.
+
+        configure() starts picamera2 over with an empty control list, so ISO,
+        shutter, B/W and the magnifier crop are sent again after every start
+        (B/W used to be lost after a capture).
+        """
+        if flush:
+            # A timed-out capture job is still queued, and stop() would
+            # wait behind it for a frame that never comes.
+            self.camera.cancel_all_and_flush()
+        self.camera.stop()
+        self.camera.configure(self._preview_config(self.camera))
+        self.camera.start()
+        self.apply_camera_settings()
+
     def capture_photo(self):
         """Capture high resolution photo"""
         current_time = time.time()
         if current_time - self.last_capture_time < BUTTON_DEBOUNCE:
             return
         self.last_capture_time = current_time
-        
+
         if self.camera_stalled_since is not None:
             print("Capture skipped: the camera is not delivering frames")
+            self._show_toast("Fotocamera non disponibile", "danger")
             return
-        
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = PHOTOS_DIR / f"photo_{timestamp}.jpg"
-        
+        failed = False
+        self._capturing = True
+        self._write_status()
+
         try:
             print(f"Capturing to {filename}...")
-            
-            # Feedback visivo
+
+            # Feedback: a brief white flash, then the frozen frame with a
+            # "saving" badge for the second or so the capture takes.
             self.screen.fill(WHITE)
             self._present()
-            time.sleep(0.1)
-            
+            time.sleep(0.06)
+            self._present_logical(self._saving_frame())
+
             # Stop preview
             self.camera.stop()
-            
-            # Config alta risoluzione
+
+            # Config alta risoluzione. Photos are always the full frame: the
+            # magnifier is a focusing aid and is left on capture.
+            self._set_zoom(1, apply=False)
             still_config = self.camera.create_still_configuration(
                 main={"size": (self.photo_width, self.photo_height), "format": "RGB888"}
             )
             self.camera.configure(still_config)
             self.camera.start()
-            
+
             self.apply_camera_settings()
             time.sleep(0.3)
-            
+
             # Capture. Bounded so a sensor that stops streaming mid-capture
             # cannot freeze the UI (TimeoutError lands in the handler below).
             self.camera.capture_file(str(filename), wait=STILL_TIMEOUT)
             print(f"Photo saved: {filename}")
-            
-            # Restore preview
-            self.camera.stop()
-            self.camera.configure(self._preview_config(self.camera))
-            self.camera.start()
-            try:
-                self.camera.set_controls({"ScalerCrop": (0, 0, 4056, 3040)})
-            except Exception:
-                pass
+            self.last_capture_name = filename.name
+            self._show_toast("Foto salvata", "success")
 
-            self.load_photos()
-            
         except Exception as e:
+            failed = True
             print(f"Capture error: {e}")
             import traceback
             traceback.print_exc()
-            
-            try:
-                # A timed-out capture job is still queued, and stop() would
-                # wait behind it for a frame that never comes.
-                self.camera.cancel_all_and_flush()
-                self.camera.stop()
-                self.camera.configure(self._preview_config(self.camera))
-                self.camera.start()
-                try:
-                    self.camera.set_controls({"ScalerCrop": (0, 0, 4056, 3040)})
-                except Exception:
-                    pass
-            except:
-                pass
+            self._show_toast("Scatto non riuscito", "danger")
+
+        # Restore preview
+        try:
+            self._restart_preview(flush=failed)
+        except Exception as e:
+            print(f"Preview restart failed: {e}")
+            self.camera_stalled_since = time.monotonic()
+        self._capturing = False
+        self.load_photos()
+        self._write_status()
 
     def load_photos(self):
         """Load photo list"""
         self.photos = sorted(PHOTOS_DIR.glob("*.jpg"), reverse=True)
-        self.photo_cache.clear()
-        self.loading_paths.clear()
+        if self.gallery_index >= len(self.photos):
+            self.gallery_index = max(0, len(self.photos) - 1)
 
     def _capture_preview_frame(self):
         """Next preview frame, or None while the sensor is not delivering any.
@@ -1502,7 +2241,17 @@ class CameraApp:
             self._restart_camera()
             wait = CAMERA_RESTART_WAIT
         try:
-            frame = self.camera.capture_array("main", wait=wait)
+            # Exposure and gain come from the same request. The old separate
+            # capture_metadata() thread took a frame every 0.4 s away from the
+            # viewfinder (27.5 instead of 30 fps).
+            request = self.camera.capture_request(wait=wait)
+            try:
+                frame = request.make_array("main")
+                metadata = request.get_metadata()
+            finally:
+                request.release()
+            self.live_exposure_us = metadata.get("ExposureTime")
+            self.live_gain = metadata.get("AnalogueGain")
         except TimeoutError:
             if self.camera_stalled_since is None:
                 self.camera_stalled_since = now
@@ -1524,10 +2273,69 @@ class CameraApp:
             self.camera.cancel_all_and_flush()
             self.camera.stop()
             self.camera.start()
-            self.camera.set_controls({"ScalerCrop": (0, 0, 4056, 3040)})
+            self.apply_camera_settings()
             print("Camera restarted")
         except Exception as e:
             print(f"Camera restart failed: {e}")
+
+    # ---------------- focus assist ----------------
+
+    def set_focus_assist(self, on):
+        """Peaking overlay plus magnifier and focus meter (the PEAK button)."""
+        self.focus_peaking_mode = on
+        print(f"Focus peaking: {on}")
+        if not on and self.zoom_level != 1:
+            self._set_zoom(1)
+        if self.peaker is not None:
+            self.peaker.reset()
+        self._meter_value = self._meter_peak = 0.0
+
+    def _set_zoom(self, level, apply=True):
+        if level == 1:
+            self.zoom_center = (0.5, 0.5)
+        if level == self.zoom_level:
+            return
+        self.zoom_level = level
+        if self.peaker is not None:
+            self.peaker.reset()
+        self._meter_value = self._meter_peak = 0.0
+        if apply:
+            self.apply_camera_settings()
+
+    def _cycle_zoom(self):
+        i = ZOOM_LEVELS.index(self.zoom_level) if self.zoom_level in ZOOM_LEVELS else 0
+        self._set_zoom(ZOOM_LEVELS[(i + 1) % len(ZOOM_LEVELS)])
+
+    def _zoom_at(self, u, v):
+        """Magnify around the point (u, v) of the current view (0..1 each)."""
+        x, y, w, h = self._scaler_crop()
+        sw, sh = SENSOR_SIZE
+        self.zoom_center = ((x + u * w) / sw, (y + v * h) / sh)
+        if self.zoom_level == 1:
+            self._set_zoom(ZOOM_LEVELS[1])
+        else:
+            if self.peaker is not None:
+                self.peaker.reset()
+            self._meter_value = self._meter_peak = 0.0
+            self.apply_camera_settings()
+
+    def _paint_peaking(self, frame):
+        """Hand the frame to the peaking worker and paint its latest result."""
+        now = time.monotonic()
+        if self.peaker is None:
+            self.peaker = FocusPeaker()
+        if not self.peaker.busy and now - self._last_peak_submit >= PEAK_INTERVAL:
+            self._last_peak_submit = now
+            self.peaker.submit(frame, PEAK_LEVELS[self.peak_level_index][1])
+        result = self.peaker.result
+        if result is not None and result[1] == frame.shape[:2]:
+            r, g, b = PEAK_COLORS[self.peak_color_index][1]
+            frame.reshape(-1, 3)[result[2]] = (b, g, r)  # frame is BGR
+        score = self.peaker.score
+        if score is not None:
+            self._meter_value += 0.5 * (score - self._meter_value)
+            # Peak hold that relaxes over a few seconds, so a new scene rescales
+            self._meter_peak = max(self._meter_value, self._meter_peak * 0.996)
 
     def update_preview(self):
         """Capture e mostra preview – OTTIMIZZATO per bassa latenza"""
@@ -1548,17 +2356,21 @@ class CameraApp:
             if frame is None or len(frame.shape) != 3:
                 return
 
-            # ── 2. BGR→RGB in un'unica copia contigua ──
-            # frame[:, :, ::-1] da sola crea una vista non-contigua (stride negativo)
-            # che rallenta PIL e frombuffer; ascontiguousarray forza una copia contigua.
-            frame_rgb = np.ascontiguousarray(frame[:, :, ::-1])
+            # The frame is BGR (picamera2 "RGB888"). pygame reads that order
+            # directly; the old frame[:, :, ::-1] copy cost ~15 ms per frame.
+            if not frame.flags.c_contiguous:
+                frame = np.ascontiguousarray(frame)
 
-            h, w = frame_rgb.shape[:2]
+            # ── 2. Focus peaking, painted into the frame (the remote sees it too) ──
+            if self.focus_peaking_mode:
+                self._paint_peaking(frame)
+
+            h, w = frame.shape[:2]
             new_w, new_h = self._preview_scaled_size
             x_off, y_off  = self._preview_offset
 
-            # ── 3. Surface dal buffer numpy senza tobytes() (buffer protocol) ──
-            src_surf = pygame.image.frombuffer(frame_rgb, (w, h), 'RGB')
+            # ── 3. Surface dal buffer numpy senza copie (buffer protocol) ──
+            src_surf = pygame.image.frombuffer(frame, (w, h), 'BGR')
 
             # ── 4. Scale C-level (SDL) alle dimensioni pre-calcolate ──
             scaled_surf = pygame.transform.scale(src_surf, (new_w, new_h))
@@ -1566,59 +2378,29 @@ class CameraApp:
             # ── 5. Blit sulla surface pre-allocata (zero nuove allocazioni) ──
             self._preview_surf.blit(scaled_surf, (x_off, y_off))
 
-            # ── 6. Focus Peaking Overlay (solo se attivo) ──
-            if self.focus_peaking_mode:
-                try:
-                    scaled_arr = pygame.surfarray.array3d(scaled_surf).transpose(1, 0, 2)
-                    gray = (0.299 * scaled_arr[:, :, 0] +
-                            0.587 * scaled_arr[:, :, 1] +
-                            0.114 * scaled_arr[:, :, 2]).astype(np.float32)
-                    lap = np.abs(
-                        np.roll(gray, 1, axis=0) + np.roll(gray, -1, axis=0) +
-                        np.roll(gray, 1, axis=1) + np.roll(gray, -1, axis=1) -
-                        4 * gray
-                    )
-                    threshold = max(float(np.percentile(lap, 97)), 18.0)
-                    mask = lap > threshold
-                    mask_rgba = np.zeros((new_h, new_w, 4), dtype=np.uint8)
-                    mask_rgba[mask, 0] = 255
-                    mask_rgba[mask, 1] = 220
-                    mask_rgba[mask, 3] = 230
-                    overlay_img = pygame.image.frombuffer(
-                        mask_rgba.tobytes(), (new_w, new_h), 'RGBA'
-                    )
-                    self._preview_surf.blit(overlay_img, (x_off, y_off))
-                except Exception as e:
-                    print(f"Focus peaking error: {e}")
-
-            # ── 7. Pubblica la surface per draw_camera_ui ──
+            # ── 6. Pubblica la surface per draw_camera_ui ──
             self.current_preview_surface = self._preview_surf
 
-            # ── 7. Shared memory per remote preview (max 5 FPS) ──
-            current_t = time.monotonic()
-            if current_t - self.last_shm_sync > 0.2:
-                self.last_shm_sync = current_t
-                try:
-                    img = _pil_image().fromarray(frame_rgb)
-                    temp_path = f"{SHARED_MEM_PREVIEW}.tmp"
-                    img.save(temp_path, "JPEG", quality=75)
-                    os.replace(temp_path, SHARED_MEM_PREVIEW)
-
-                    status = {
-                        "iso":     str(ISO_VALUES[self.current_iso_index]),
-                        "shutter": SHUTTER_SPEEDS[self.current_shutter_index][0],
-                        "mode":    "remote" if self.remote_active else "local",
-                        "status":  "active"
-                    }
-                    temp_status = f"{SHARED_MEM_STATUS}.tmp"
-                    with open(temp_status, 'w') as f:
-                        json.dump(status, f)
-                    os.replace(temp_status, SHARED_MEM_STATUS)
-                except Exception as e:
-                    print(f"SHM Sync Error: {e}")
+            # ── 7. Web remote preview, encoded on a worker thread ──
+            self._feed_remote(frame)
 
         except Exception as e:
             print(f"Update Preview Error: {e}")
+
+    def _feed_remote_only(self):
+        """While a menu covers the viewfinder, keep the web remote's preview going."""
+        if not self.remote_active or self.camera is None or self.camera_stalled_since is not None:
+            return
+        if time.monotonic() - self._last_remote_frame < 1.0 / REMOTE_FPS:
+            return
+        try:
+            frame = self.camera.capture_array("main", wait=FRAME_TIMEOUT)
+        except Exception:
+            return
+        if frame is not None and len(frame.shape) == 3:
+            self._feed_remote(np.ascontiguousarray(frame))
+
+    # ---------------- camera HUD ----------------
 
     def _live_shutter_text(self):
         """Format the live AE exposure as a shutter fraction, or None if unknown."""
@@ -1657,7 +2439,7 @@ class CameraApp:
         self.draw_arrow(surface, down_center, "down")
 
     def draw_camera_ui(self):
-        """Disegna UI camera - FULL PREVIEW + TRASPARENZA"""
+        """Camera HUD over the live preview, drawn the right way up (see _compose)."""
         # Surface riusata per l'intera UI: allocarne una nuova a ogni frame
         # costava una malloc + clear di ~600 KB 30 volte al secondo.
         ui_surface = self._ui_surface
@@ -1675,7 +2457,7 @@ class CameraApp:
         # The image above is the last frame received; say so if it is stale.
         if self.camera_stalled_since is not None:
             self._draw_stall_warning(ui_surface)
-        
+
         # 2. Sidebars (Left and Right) - pre-rendered gradient chrome
         ui_surface.blit(self._left_bar_surf, self.left_bar_rect)
         ui_surface.blit(self._right_bar_surf, self.right_bar_rect)
@@ -1705,28 +2487,12 @@ class CameraApp:
         )
 
         # 5. Right Sidebar Procedural Icons
-        
-        # POWER (Top)
         self.draw_icon(ui_surface, "power", self.power_center)
-        
-        # GALLERY / GRID (Middle)
         self.draw_icon(ui_surface, "grid", self.gallery_center)
-        
-        # B/W (Bottom)
         self.draw_icon(ui_surface, "bw", self.bw_center, active=self.grayscale_mode)
-        
-        # FOCUS PEAKING (Bottom)
         self.draw_icon(ui_surface, "fp", self.fp_center, active=self.focus_peaking_mode)
-        
-        # 7. Power popup
-        if self.show_power_popup:
-            # Draw popup directly on screen later or include it here
-            pass
 
-        # 8. Battery Indicator (Top Right)
-        # Fix: User sees it at bottom-left visually now with (15, self.height-35)
-        # If it's bottom-left visually, and we want top-right visually:
-        # We move it diagonally.
+        # 6. Battery Indicator (Top Right)
         if self.battery and self.battery.available:
             batt_val = int(self.battery.percentage)
             # Pill icon + numeral, right-aligned in the top-right corner.
@@ -1736,7 +2502,12 @@ class CameraApp:
             ui_surface.blit(batt_text, (icon_rect.right + 8, icon_rect.centery
                                         - batt_text.get_height() // 2))
 
-        # 9. Debug Overlay (if enabled)
+        # 7. Letterbox bars: toasts / remote indicator above, focus tools below
+        self._draw_top_bar(ui_surface)
+        if self.focus_peaking_mode:
+            self._draw_focus_toolbar(ui_surface)
+
+        # 8. Debug Overlay (if enabled)
         if DEBUG_MODE and self.battery and self.battery.available:
             debug_lines = [
                 f"Batt: {self.battery.percentage:.1f}% ({self.battery.voltage:.3f}V)",
@@ -1747,18 +2518,8 @@ class CameraApp:
                 debug_surf = self.small_font.render(line, True, YELLOW)
                 ui_surface.blit(debug_surf, (10, y_offset))
                 y_offset += 20
-        
-        # 10. ROTAZIONE 180
-        rotated_surface = pygame.transform.rotate(ui_surface, 180)
-        self.screen.blit(rotated_surface, (0, 0))
-        
-        # Draw popup over everything else if active
-        if self.show_power_popup:
-            self.draw_power_popup()
-        elif self.show_wifi_popup:
-            self.draw_wifi_popup()
-        elif self.show_password_popup:
-            self.draw_password_popup()
+
+        return ui_surface
 
     def _draw_stall_warning(self, surface):
         """Card over the preview while the sensor is not delivering frames."""
@@ -1772,273 +2533,94 @@ class CameraApp:
         surface.blit(hint, hint.get_rect(centerx=card.centerx,
                                          y=card.y + 12 + title.get_height()))
 
-    def _begin_popup(self, title=None, title_font=None):
-        """Scrim + rounded panel shared by every popup. Returns the surface."""
-        popup_surface = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+    def _draw_top_bar(self, surface):
+        """Toast, or the remote indicator, in the letterbox bar above the image."""
+        area = pygame.Rect(self.image_rect.x, self.preview_rect.y, self.image_rect.w,
+                           self.image_rect.y - self.preview_rect.y)
+        if area.h < 36:
+            area = pygame.Rect(self.image_rect.x, self.image_rect.y, self.image_rect.w, 48)
+        toast = self._active_toast()
+        if toast:
+            text, tone, until = toast
+            pill = self._toast_surface(text, tone)
+            # Fade out over the last 0.3 s
+            pill.set_alpha(int(255 * min(1.0, (until - time.monotonic()) / 0.3)))
+            surface.blit(pill, pill.get_rect(center=area.center))
+        elif self.remote_active:
+            chip = self._chip_surface("TELECOMANDO", "phone", ACCENT)
+            surface.blit(chip, chip.get_rect(center=area.center))
 
-        overlay = pygame.Surface((self.width, self.height))
-        overlay.set_alpha(215)
-        overlay.fill((6, 7, 9))
-        popup_surface.blit(overlay, (0, 0))
+    def _draw_focus_toolbar(self, surface):
+        tb = self.toolbar
+        key = (self.zoom_level, self._scaler_crop(), self.peak_color_index, self.peak_level_index)
+        static = self._toolbar_cache.get(key)
+        if static is None:
+            static = self._render_toolbar(key)
+            self._toolbar_cache.clear()
+            self._toolbar_cache[key] = static
+        surface.blit(static, tb["bar"].topleft)
 
-        # Panel: single hairline border instead of the old heavy 2px gray one.
-        pygame.draw.rect(popup_surface, SURFACE_1, self.popup_rect, border_radius=18)
-        pygame.draw.rect(popup_surface, HAIRLINE, self.popup_rect, width=1, border_radius=18)
+        # Focus meter: bar relative to the best value seen lately. Turn the
+        # ring until the bar reaches the marker.
+        m = tb["meter"]
+        track = pygame.Rect(m.x + 66, m.centery - 4, m.w - 80, 8)
+        pygame.draw.rect(surface, SURFACE_3, track, border_radius=4)
+        peak = self._meter_peak
+        scale = max(peak * 1.1, 1.0)
+        fill_w = int(track.w * min(1.0, self._meter_value / scale))
+        near_peak = peak > 0 and self._meter_value >= 0.93 * peak
+        if fill_w > 0:
+            pygame.draw.rect(surface, ACCENT if near_peak else TEXT_MID,
+                             (track.x, track.y, fill_w, track.h), border_radius=4)
+        if peak > 0:
+            px = track.x + int(track.w * min(1.0, peak / scale))
+            pygame.draw.rect(surface, TEXT_HI, (px - 1, track.y - 6, 3, track.h + 12), border_radius=1)
 
-        if title:
-            # No divider rule: the button grid and the WiFi back button are
-            # positioned by setup_ui and start high enough that a rule under the
-            # title collides with them.
-            font = title_font or self.small_bold_font
-            title_surf = font.render(title, True, TEXT_HI)
-            popup_surface.blit(
-                title_surf,
-                title_surf.get_rect(centerx=self.popup_rect.centerx,
-                                    y=self.popup_rect.y + 14))
-        return popup_surface
+    def _render_toolbar(self, key):
+        """Static part of the focus toolbar (chips, labels, zoom map)."""
+        tb = self.toolbar
+        bar = tb["bar"]
+        surf = pygame.Surface(bar.size, pygame.SRCALPHA)
+        if self._toolbar_floating:
+            pygame.draw.rect(surf, (0, 0, 0, 150), surf.get_rect())
 
-    def _end_popup(self, popup_surface):
-        """Rotate 180 and present, matching the rest of the UI."""
-        self.screen.blit(pygame.transform.rotate(popup_surface, 180), (0, 0))
+        def local(r):
+            return r.move(-bar.x, -bar.y)
 
-    def draw_power_popup(self):
-        """Power menu popup - RUOTATO SE SERVE"""
-        popup_surface = self._begin_popup("MENU SISTEMA")
+        zoomed = self.zoom_level > 1
+        # Zoom chip: level and a map of where the magnified window sits
+        z = local(tb["zoom"])
+        self.draw_card(surf, z, radius=12, border=ACCENT if zoomed else HAIRLINE)
+        label = self._text(self.small_bold_font, f"×{self.zoom_level}", ACCENT if zoomed else TEXT_HI)
+        surf.blit(label, label.get_rect(midleft=(z.x + 10, z.centery)))
+        mm = pygame.Rect(0, 0, 28, 21)
+        mm.midright = (z.right - 9, z.centery)
+        pygame.draw.rect(surf, TEXT_LOW, mm, 1, border_radius=2)
+        x, y, w, h = self._scaler_crop()
+        sw, sh = SENSOR_SIZE
+        win = pygame.Rect(mm.x + round(x / sw * mm.w), mm.y + round(y / sh * mm.h),
+                          max(3, round(w / sw * mm.w)), max(3, round(h / sh * mm.h)))
+        pygame.draw.rect(surf, ACCENT if zoomed else TEXT_LOW, win, 0 if zoomed else 1, border_radius=1)
 
-        # Buttons - now 2 rows (removed LCD Off)
-        self.draw_button_on_surface(popup_surface, self.popup_shutdown_btn, "Spegni Pi", DANGER)
+        m = local(tb["meter"])
+        self.draw_card(surf, m, radius=12)
+        self.draw_label(surf, "FOCUS", (m.x + 34, m.centery))
 
-        standby_color = ACCENT if self.standby_mode else INFO
-        standby_text = "Risveglia" if self.standby_mode else "Standby"
-        self.draw_button_on_surface(popup_surface, self.popup_standby_btn, standby_text,
-                                    standby_color,
-                                    text_color=SURFACE_0 if self.standby_mode else WHITE)
+        c = local(tb["color"])
+        self.draw_card(surf, c, radius=12)
+        color = PEAK_COLORS[self.peak_color_index][1]
+        self._blit_icon(surf, "dot", c.center, 20, color)
+        self._blit_icon(surf, "ring", c.center, 28, TEXT_HI)
 
-        server_active = self.check_server_status()
-        server_color = SUCCESS if server_active else SURFACE_2
-        server_text = "Server: ON" if server_active else "Server: OFF"
-        self.draw_button_on_surface(popup_surface, self.popup_server_btn, server_text,
-                                    server_color,
-                                    text_color=WHITE if server_active else TEXT_MID)
-
-        hotspot_active = self.check_hotspot_status()
-        hotspot_color = SUCCESS if hotspot_active else SURFACE_2
-        hotspot_text = "Hotspot: ON" if hotspot_active else "Hotspot: OFF"
-        self.draw_button_on_surface(popup_surface, self.popup_hotspot_btn, hotspot_text,
-                                    hotspot_color,
-                                    text_color=WHITE if hotspot_active else TEXT_MID)
-
-        # WiFi Manager button (Row 3)
-        self.draw_button_on_surface(popup_surface, self.popup_wifi_btn, "WiFi Manager", INFO)
-
-        # Show IP info in self.popup_rect area below buttons
-        # Now buttons occupy 3 rows, so adjust info display area
-        info_y_start = self.popup_rect.y + int(250 * self.scale)
-        
-        if server_active and not hotspot_active:
-            # Get actual IP address for local network
-            try:
-                import socket
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(('10.255.255.255', 1))
-                ip_address = s.getsockname()[0]
-                s.close()
-                if ip_address and not ip_address.startswith("127."):
-                    server_info = self.micro_font.render(f"Server: http://{ip_address}:8080", True, TEXT_MID)
-                    popup_surface.blit(server_info, (self.popup_rect.centerx - server_info.get_width()//2, info_y_start))
-                    info_y_start += 25
-            except:
-                pass
-
-        if hotspot_active:
-            info_h = self.micro_font.render("SSID: RaspiCam | Pass: raspicam_admin", True, TEXT_MID)
-            info_ip = self.micro_font.render("Hotspot: http://10.42.0.1:8080", True, TEXT_MID)
-            popup_surface.blit(info_h, (self.popup_rect.centerx - info_h.get_width()//2, info_y_start))
-            popup_surface.blit(info_ip, (self.popup_rect.centerx - info_ip.get_width()//2, info_y_start + 25))
-
-        self.draw_button_on_surface(popup_surface, self.popup_cancel_btn, "Chiudi",
-                                    SURFACE_2, text_color=TEXT_MID)
-
-        self._end_popup(popup_surface)
-
-    def draw_wifi_popup(self):
-        """WiFi selection popup"""
-        popup_surface = self._begin_popup("RETI WIFI")
-
-        # Back button
-        back_btn = pygame.Rect(self.popup_rect.x + 10, self.popup_rect.y + 10, 100, 50)
-        self.draw_button_on_surface(popup_surface, back_btn, "< MENU", SURFACE_2,
-                                    text_color=TEXT_MID)
-
-        # Network list
-        list_y = self.popup_rect.y + 70
-        item_height = int(50 * self.scale)
-
-        if not self.wifi_networks:
-            # Scanning message
-            scan_text = self.small_font.render("Scansione reti…", True, TEXT_MID)
-            popup_surface.blit(scan_text, (self.popup_rect.centerx - scan_text.get_width()//2, list_y + 50))
-        else:
-            # Show networks
-            for i, network in enumerate(self.wifi_networks[:6]):  # Show max 6 networks
-                net_rect = pygame.Rect(self.popup_rect.x + 20, list_y + i * (item_height + 5),
-                                      self.popup_rect.width - 40, item_height)
-
-                # Row as a raised card
-                self.draw_card(popup_surface, net_rect, radius=10)
-
-                # SSID
-                ssid_text = self.small_bold_font.render(network['ssid'][:25], True, TEXT_HI)
-                popup_surface.blit(ssid_text, (net_rect.x + 12, net_rect.centery - 16))
-
-                # Security - a drawn padlock reads faster than the word alone
-                # (FreeSans has no emoji coverage, so the glyph is vector-drawn).
-                text_x = net_rect.x + 12
-                if network['security'] not in ('Open', '', '--'):
-                    ly = net_rect.centery + 9
-                    pygame.draw.rect(popup_surface, TEXT_LOW, (text_x, ly, 7, 5),
-                                     border_radius=1)
-                    pygame.draw.arc(popup_surface, TEXT_LOW,
-                                    (text_x + 1, ly - 5, 5, 8), 0, math.pi, 1)
-                    text_x += 11
-                info_text = self.micro_font.render(network['security'], True, TEXT_LOW)
-                popup_surface.blit(info_text, (text_x, net_rect.centery + 4))
-
-                # Signal bars visualization
-                bars_x = net_rect.right - 60
-                bars_y = net_rect.centery - 10
-                signal_level = network['signal'] // 25  # 0-4 bars
-                for b in range(4):
-                    bar_color = SUCCESS if b < signal_level else SURFACE_3
-                    bar_height = (b + 1) * 4
-                    pygame.draw.rect(popup_surface, bar_color,
-                                   (bars_x + b * 12, bars_y + (16 - bar_height), 8, bar_height),
-                                   border_radius=2)
-
-        self._end_popup(popup_surface)
-
-    def draw_password_popup(self):
-        """Password input popup with virtual keyboard"""
-        popup_surface = self._begin_popup()
-
-        # Title
-        if self.password_network:
-            title = self.small_bold_font.render(
-                f"Password: {self.password_network['ssid'][:20]}", True, TEXT_HI)
-            title_rect = title.get_rect(centerx=self.popup_rect.centerx, y=self.popup_rect.y + 15)
-            popup_surface.blit(title, title_rect)
-
-        # Password input field
-        input_y = self.popup_rect.y + 50
-        input_rect = pygame.Rect(self.popup_rect.x + 20, input_y, self.popup_rect.width - 40, 40)
-        pygame.draw.rect(popup_surface, SURFACE_0, input_rect, border_radius=8)
-        # Focus ring in the accent colour rather than a flat blue outline
-        pygame.draw.rect(popup_surface, ACCENT if self.password_input else HAIRLINE,
-                         input_rect, width=1, border_radius=8)
-
-        # Show password as dots
-        if self.password_input:
-            pwd_text = self.small_bold_font.render("•" * len(self.password_input[:30]), True, TEXT_HI)
-        else:
-            pwd_text = self.small_font.render("Inserisci password", True, TEXT_LOW)
-        popup_surface.blit(pwd_text, (input_rect.x + 12,
-                                      input_rect.centery - pwd_text.get_height() // 2))
-        
-        # Keyboard layout - Compact QWERTY for 480x320
-        kb_y = self.popup_rect.y + 105
-        key_w = int(28 * self.scale)  # Key width
-        key_h = int(35 * self.scale)  # Key height
-        key_gap = int(3 * self.scale)
-        
-        # Define keyboard rows
-        rows = [
-            ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
-            ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
-            ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l'],
-            ['⇧', 'z', 'x', 'c', 'v', 'b', 'n', 'm', '⌫']
-        ]
-        
-        # Draw keyboard
-        for row_idx, row in enumerate(rows):
-            row_y = kb_y + row_idx * (key_h + key_gap)
-            # Center align row
-            row_width = len(row) * key_w + (len(row) - 1) * key_gap
-            start_x = self.popup_rect.centerx - row_width // 2
-            
-            for col_idx, key in enumerate(row):
-                key_x = start_x + col_idx * (key_w + key_gap)
-                key_rect = pygame.Rect(key_x, row_y, key_w, key_h)
-                
-                # Keycap: modifiers sit darker than letters; active shift is accent.
-                shift_on = key == '⇧' and self.keyboard_shift
-                if shift_on:
-                    color, label_color = ACCENT, SURFACE_0
-                elif key in ['⇧', '⌫']:
-                    color, label_color = SURFACE_3, TEXT_HI
-                else:
-                    color, label_color = SURFACE_2, TEXT_HI
-
-                self._draw_keycap(popup_surface, key_rect, color)
-
-                # Key label. Shift/backspace are drawn as vectors: neither
-                # FreeSansBold nor the old default font actually carries those
-                # code points, so rendering them as text produced tofu boxes.
-                if key in ('⇧', '⌫'):
-                    self._draw_key_glyph(popup_surface, key, key_rect.center,
-                                         label_color, color)
-                else:
-                    label = key.upper() if self.keyboard_shift and key.isalpha() else key
-                    key_text = self.small_bold_font.render(label, True, label_color)
-                    text_rect = key_text.get_rect(center=key_rect.center)
-                    popup_surface.blit(key_text, text_rect)
-
-        # Space bar
-        space_y = kb_y + 4 * (key_h + key_gap)
-        space_w = int(key_w * 5)
-        space_rect = pygame.Rect(self.popup_rect.centerx - space_w // 2, space_y, space_w, key_h)
-        self._draw_keycap(popup_surface, space_rect, SURFACE_2)
-        space_text = self.micro_font.render("SPAZIO", True, TEXT_MID)
-        popup_surface.blit(space_text, space_text.get_rect(center=space_rect.center))
-
-        # Action buttons (Connect / Cancel)
-        btn_y = self.popup_rect.bottom - 60
-        btn_w = int(self.popup_rect.width * 0.4)
-        btn_h = 45
-
-        connect_rect = pygame.Rect(self.popup_rect.x + 20, btn_y, btn_w, btn_h)
-        cancel_rect = pygame.Rect(self.popup_rect.right - btn_w - 20, btn_y, btn_w, btn_h)
-
-        self.draw_button_on_surface(popup_surface, connect_rect, "CONNETTI", SUCCESS)
-        self.draw_button_on_surface(popup_surface, cancel_rect, "ANNULLA", SURFACE_2,
-                                    text_color=TEXT_MID)
-
-        self._end_popup(popup_surface)
-
-    def _draw_key_glyph(self, surface, key, center, color, bg):
-        """Vector shift / backspace glyphs (see caller: the fonts lack them).
-
-        `bg` is the keycap fill, used to knock the X out of the backspace tag.
-        """
-        x, y = center
-        if key == '⇧':
-            # Upward arrowhead over a short stem
-            pygame.draw.polygon(surface, color,
-                                [(x, y - 7), (x - 7, y), (x + 7, y)])
-            pygame.draw.rect(surface, color, (x - 3, y, 6, 6))
-        else:  # '⌫'
-            # Left-pointing tag with an X knocked out of it
-            pygame.draw.polygon(surface, color, [
-                (x - 8, y), (x - 3, y - 6), (x + 8, y - 6),
-                (x + 8, y + 6), (x - 3, y + 6),
-            ])
-            pygame.draw.line(surface, bg, (x, y - 3), (x + 5, y + 3), 2)
-            pygame.draw.line(surface, bg, (x + 5, y - 3), (x, y + 3), 2)
-
-    def _draw_keycap(self, surface, rect, color):
-        """Keycap with a 1px bottom shadow so the row reads as physical keys."""
-        shadow = rect.move(0, 1)
-        pygame.draw.rect(surface, SURFACE_0, shadow, border_radius=6)
-        pygame.draw.rect(surface, color, rect, border_radius=6)
+        lv = local(tb["level"])
+        self.draw_card(surf, lv, radius=12)
+        base_x, base_y = lv.centerx - 14, lv.centery + 10
+        for i in range(3):
+            bh = 8 + 6 * i
+            on = i <= self.peak_level_index
+            pygame.draw.rect(surf, ACCENT if on else SURFACE_3,
+                             (base_x + i * 11, base_y - bh, 7, bh), border_radius=2)
+        return surf
 
     # ---------------- modern UI primitives ----------------
 
@@ -2076,10 +2658,6 @@ class CameraApp:
             self._text_cache[key] = surf
         return surf
 
-    def _tint(self, color, factor):
-        """Lighten (factor>1) or darken (factor<1) a colour, clamped to 0-255."""
-        return tuple(max(0, min(255, int(c * factor))) for c in color[:3])
-
     def draw_card(self, surface, rect, radius=12, fill=SURFACE_2, border=HAIRLINE):
         """Rounded surface used to group related controls."""
         if fill is not None:
@@ -2108,22 +2686,6 @@ class CameraApp:
                 x += ch.get_width() + tracking
             self._label_cache[key] = cached
         surface.blit(cached, cached.get_rect(center=center))
-
-    def draw_button_on_surface(self, surface, rect, text, color=BLUE, text_color=WHITE):
-        """Filled pill button.
-
-        The old style outlined every button in 1px white, which read as dated and
-        muddied the colour. Depth now comes from a subtle lighter top edge.
-        """
-        radius = min(14, rect.height // 2)
-        pygame.draw.rect(surface, color, rect, border_radius=radius)
-        # 1px highlight along the top edge suggests a light source above.
-        highlight = pygame.Rect(rect.x + radius // 2, rect.y,
-                                max(1, rect.width - radius), 1)
-        pygame.draw.rect(surface, self._tint(color, 1.35), highlight)
-
-        text_surface = self.small_bold_font.render(text, True, text_color)
-        surface.blit(text_surface, text_surface.get_rect(center=rect.center))
 
     def draw_arrow(self, surface, center, direction):
         """Chevron (two strokes) - lighter and more modern than a filled triangle."""
@@ -2157,22 +2719,8 @@ class CameraApp:
     def draw_icon(self, surface, name, center, size=30, color=WHITE, active=False):
         """Draw procedural icons for sharper look"""
         x, y = center
-        
-        if name == "trash":
-            # Trash Icon: Bin body and lid
-            w, h = size * 0.7, size * 0.8
-            # Body
-            body_rect = pygame.Rect(x - w//2, y - h//2 + 5, w, h - 5)
-            pygame.draw.rect(surface, color, body_rect, 2)
-            # Lid
-            lid_w = w + 8
-            pygame.draw.line(surface, color, (x - lid_w//2, y - h//2), (x + lid_w//2, y - h//2), 2)
-            # Handle
-            pygame.draw.line(surface, color, (x - 4, y - h//2 - 4), (x + 4, y - h//2 - 4), 2)
-            pygame.draw.line(surface, color, (x - 4, y - h//2 - 4), (x - 4, y - h//2), 2)
-            pygame.draw.line(surface, color, (x + 4, y - h//2 - 4), (x + 4, y - h//2), 2)
-        
-        elif name == "power":
+
+        if name == "power":
             # Power glyph: IEC standard ring-with-break plus vertical stroke,
             # sitting in a circular well so it reads as a pressable target.
             #
@@ -2240,351 +2788,1095 @@ class CameraApp:
             self.draw_label(surface, "PEAK", (x, y + r + 7),
                             color=ACCENT if active else TEXT_LOW)
 
-    def draw_gallery_ui(self):
-        """Gallery UI con rotazione"""
-        gallery_surf = pygame.Surface((self.width, self.height))
-        gallery_surf.fill(SURFACE_0)
+    # ---------------- menu primitives ----------------
 
-        if not self.photos:
-            text = self.font.render("Nessuna foto", True, TEXT_MID)
-            text_rect = text.get_rect(center=(self.width // 2, self.height // 2 - 10))
-            gallery_surf.blit(text, text_rect)
-            hint = self.micro_font.render("Scatta per iniziare", True, TEXT_LOW)
-            gallery_surf.blit(hint, hint.get_rect(center=(self.width // 2, self.height // 2 + 14)))
+    def _icon(self, name, size, color, level=4):
+        """Anti-aliased vector icon: drawn 4x oversize, smooth-scaled down, cached."""
+        key = (name, size, color, level)
+        surf = self._icon_cache.get(key)
+        if surf is None:
+            big = pygame.Surface((size * 4, size * 4), pygame.SRCALPHA)
+            _draw_icon_shape(big, name, size * 4, color, level)
+            surf = pygame.transform.smoothscale(big, (size, size))
+            self._icon_cache[key] = surf
+        return surf
+
+    def _blit_icon(self, surf, name, center, size, color, level=4):
+        icon = self._icon(name, size, color, level)
+        surf.blit(icon, icon.get_rect(center=(int(center[0]), int(center[1]))))
+
+    def _rrect(self, surf, rect, color, radius, width=0):
+        """Rounded rectangle; a colour with alpha is blended over what is below."""
+        rect = pygame.Rect(rect)
+        if len(color) == 4 and color[3] < 255:
+            layer = pygame.Surface(rect.size, pygame.SRCALPHA)
+            pygame.draw.rect(layer, color, layer.get_rect(), width, border_radius=radius)
+            surf.blit(layer, rect.topleft)
         else:
+            pygame.draw.rect(surf, color[:3], rect, width, border_radius=radius)
+
+    def _glass(self, surf, rect, radius, active=False, strength=1.0):
+        """Translucent panel over the frosted backdrop (amber-tinted when active)."""
+        if active:
+            fill, border = (*ACCENT, 46), (*ACCENT, 150)
+        else:
+            fill, border = (255, 255, 255, int(20 * strength)), (255, 255, 255, int(32 * strength))
+        self._rrect(surf, rect, fill, radius)
+        self._rrect(surf, rect, border, radius, width=1)
+
+    def _disc(self, surf, center, r, color):
+        x, y = int(center[0]), int(center[1])
+        gfxdraw.filled_circle(surf, x, y, r, color)
+        gfxdraw.aacircle(surf, x, y, r, color)
+
+    def _spinner(self, surf, center, r, color, width=3):
+        """Activity arc; the menus re-render ~10 times a second while one spins."""
+        phase = int(time.monotonic() * 10) % 12 * 30
+        size = 2 * r + width + 4
+        layer = pygame.Surface((size * 2, size * 2), pygame.SRCALPHA)
+        _arc_band(layer, color, (size, size), r * 2, width * 2, -phase, -phase + 110)
+        layer = pygame.transform.smoothscale(layer, (size, size))
+        surf.blit(layer, layer.get_rect(center=(int(center[0]), int(center[1]))))
+
+    def _fit(self, font, text, max_w):
+        """Text shortened with an ellipsis to fit max_w pixels."""
+        if font.size(text)[0] <= max_w:
+            return text
+        while text and font.size(text + "…")[0] > max_w:
+            text = text[:-1]
+        return text + "…"
+
+    def _wrap(self, font, text, max_w):
+        lines, line = [], ""
+        for word in text.split():
+            trial = f"{line} {word}".strip()
+            if font.size(trial)[0] <= max_w or not line:
+                line = trial
+            else:
+                lines.append(line)
+                line = word
+        if line:
+            lines.append(line)
+        return lines
+
+    def _blit_lines(self, surf, font, text, color, pos, max_w, line_h=None, center=False, max_lines=4):
+        x, y = pos
+        line_h = line_h or font.get_linesize()
+        for line in self._wrap(font, text, max_w)[:max_lines]:
+            s = font.render(line, True, color)
+            surf.blit(s, s.get_rect(midtop=(x, y)) if center else (x, y))
+            y += line_h
+        return y
+
+    def _chip_surface(self, label, icon, color):
+        key = ("chip", label, icon, color)
+        surf = self._text_cache.get(key)
+        if surf is None:
+            text = self.f_caption_b.render(label, True, color)
+            w, h = text.get_width() + 46, 30
+            surf = pygame.Surface((w, h), pygame.SRCALPHA)
+            pygame.draw.rect(surf, (*SURFACE_2, 235), surf.get_rect(), border_radius=h // 2)
+            pygame.draw.rect(surf, (*color, 110), surf.get_rect(), 1, border_radius=h // 2)
+            self._blit_icon(surf, icon, (20, h // 2), 18, color)
+            surf.blit(text, (34, (h - text.get_height()) // 2))
+            self._text_cache[key] = surf
+        return surf
+
+    def _toast_surface(self, text, tone):
+        key = ("toast", text, tone)
+        surf = self._text_cache.get(key)
+        if surf is None:
+            color = {"success": SUCCESS, "danger": DANGER, "accent": ACCENT}.get(tone, INFO)
+            label = self.f_caption_b.render(text, True, TEXT_HI)
+            w, h = label.get_width() + 50, 36
+            surf = pygame.Surface((w, h), pygame.SRCALPHA)
+            pygame.draw.rect(surf, (*SURFACE_1, 242), surf.get_rect(), border_radius=h // 2)
+            pygame.draw.rect(surf, (*HAIRLINE, 255), surf.get_rect(), 1, border_radius=h // 2)
+            self._blit_icon(surf, "dot", (20, h // 2), 10, color)
+            surf.blit(label, (34, (h - label.get_height()) // 2))
+            self._text_cache[key] = surf
+        return surf.copy()
+
+    def _active_toast(self):
+        if self._toast and self._toast[2] > time.monotonic():
+            return self._toast
+        return None
+
+    def _frost(self, surf):
+        """Blurred, darkened copy of a frame: the backdrop behind the menus."""
+        w, h = surf.get_size()
+        small = pygame.transform.smoothscale(surf, (max(1, w // 10), max(1, h // 10)))
+        small = pygame.transform.smoothscale(small, (max(1, w // 20), max(1, h // 20)))
+        out = pygame.transform.smoothscale(small, (w, h))
+        out.fill((72, 76, 86), special_flags=pygame.BLEND_RGB_MULT)
+        return out
+
+    def _qr(self, text):
+        matrix = self._qr_cache.get(("matrix", text))
+        if matrix is None:
+            matrix = self._qr_cache[("matrix", text)] = qr_matrix(text)
+        return matrix
+
+    def _qr_surface(self, text, max_size, tile_modules=None):
+        """QR code on a white tile with a two-module quiet zone.
+
+        Modules are whole pixels; tile_modules makes codes of different
+        versions share one tile size (the smaller one is centred).
+        """
+        key = (text, max_size, tile_modules)
+        surf = self._qr_cache.get(key)
+        if surf is None:
+            matrix = self._qr(text)
+            total = max(tile_modules or 0, len(matrix)) + 4
+            module = max(2, max_size // total)
+            offset = (total - len(matrix)) // 2
+            surf = pygame.Surface((total * module, total * module), pygame.SRCALPHA)
+            pygame.draw.rect(surf, WHITE, surf.get_rect(), border_radius=module * 2)
+            for r, row in enumerate(matrix):
+                for c, dark in enumerate(row):
+                    if dark:
+                        surf.fill(BLACK, ((c + offset) * module, (r + offset) * module, module, module))
+            self._qr_cache[key] = surf
+        return surf
+
+    # ---------------- overlays (menus) ----------------
+
+    def _current_logical(self):
+        if self.mode == "gallery" and self._gallery_logical is not None:
+            return self._gallery_logical
+        return self._ui_surface
+
+    def _open_overlay(self, name):
+        """Show a menu screen; the first one freezes a frosted copy of the view behind it."""
+        if self.overlay is None:
+            self._backdrop = self._frost(self._current_logical())
+        self.overlay = name
+        self._overlay_frame = None
+        self._hits = []
+        if name in ("menu", "wifi", "password"):
+            self._start_net_monitor()
+        if name == "wifi" and not self.wifi_networks:
+            self.scan_wifi_networks()
+
+    def _close_overlay(self):
+        self.overlay = None
+        self._confirm = None
+        self._backdrop = None
+        self._overlay_frame = None
+        self._hits = []
+        self._last_presented = None
+
+    def _ask(self, title, body, icon, tone, ok_label, action):
+        """Confirmation dialog; Cancel returns to the screen it was opened from."""
+        self._confirm = {"title": title, "body": body, "icon": icon, "tone": tone,
+                         "ok": ok_label, "action": action, "back": self.overlay}
+        self._open_overlay("confirm")
+
+    def _cancel_confirm(self):
+        back = self._confirm["back"] if self._confirm else None
+        self._confirm = None
+        if back:
+            self._open_overlay(back)
+        else:
+            self._close_overlay()
+
+    def _hit(self, rect, action, radius=16):
+        """Register a touch target for the overlay being drawn (radius None: no highlight)."""
+        self._hits.append((pygame.Rect(rect), radius, action))
+
+    def _overlay_signature(self):
+        """Everything an overlay shows; it is re-rendered only when this changes."""
+        now = time.monotonic()
+        toast = self._active_toast()
+        flash = self._flash if self._flash and self._flash[2] > now else None
+        animating = bool(self._busy) or self.wifi_scanning
+        sig = [self.overlay, id(self._confirm), tuple(sorted(self.net.items())),
+               tuple(sorted(self._busy.items())), self.wifi_scanning, id(self.wifi_networks),
+               self.wifi_page, toast[:2] if toast else None,
+               (tuple(flash[0]), flash[1]) if flash else None,
+               int(now * 10) if animating else None]
+        if self.overlay == "password":
+            sig += [self.password_input, self.password_visible, self.keyboard_shift,
+                    self.keyboard_symbols, int(now * 2) % 2, now - self._last_key_time < 1.0]
+        return tuple(sig)
+
+    def _overlay_surface(self):
+        sig = self._overlay_signature()
+        if self._overlay_frame is None or self._overlay_frame[0] != sig:
+            surf = self._backdrop.copy() if self._backdrop is not None else pygame.Surface((self.width, self.height))
+            self._hits = []
+            {"menu": self._render_menu, "wifi": self._render_wifi,
+             "password": self._render_password, "confirm": self._render_confirm,
+             "shutdown": self._render_shutdown}[self.overlay](surf)
+            flash = self._flash
+            if flash and flash[2] > time.monotonic() and flash[1] is not None:
+                self._rrect(surf, flash[0], (255, 255, 255, 46), flash[1])
+            toast = self._active_toast()
+            if toast and self.overlay != "shutdown":
+                pill = self._toast_surface(toast[0], toast[1])
+                surf.blit(pill, pill.get_rect(center=(self.width // 2, self.height - 34)))
+            self._overlay_frame = (sig, pygame.transform.rotate(surf, 180))
+        return self._overlay_frame[1]
+
+    def _touch_overlay(self, pos):
+        for rect, radius, action in reversed(self._hits):
+            if rect.collidepoint(pos):
+                if radius is not None:
+                    self._flash = (rect, radius, time.monotonic() + 0.18)
+                action()
+                return
+
+    def _header(self, surf, title, subtitle, back=None, right=None):
+        """Title block of the menu screens: optional back button, title, subtitle, right button."""
+        x = 24
+        if back:
+            r = pygame.Rect(16, 16, 50, 50)
+            self._round_button(surf, r, "back")
+            self._hit(r.inflate(12, 12), back, r.w // 2 + 6)
+            x = 78
+        surf.blit(self._text(self.f_title, title, TEXT_HI), (x, 17))
+        if subtitle:
+            max_w = self.width - x - (84 if right else 24)
+            surf.blit(self._text(self.f_caption, self._fit(self.f_caption, subtitle, max_w), TEXT_MID),
+                      (x, 53))
+        if right:
+            icon, action, spinning = right
+            r = pygame.Rect(self.width - 66, 16, 50, 50)
+            self._round_button(surf, r, icon, spinning=spinning)
+            self._hit(r.inflate(12, 12), action, r.w // 2 + 6)
+
+    def _round_button(self, surf, r, icon, spinning=False, color=TEXT_HI):
+        self._disc(surf, r.center, r.w // 2, (255, 255, 255, 26))
+        gfxdraw.aacircle(surf, r.centerx, r.centery, r.w // 2, (255, 255, 255, 50))
+        if spinning:
+            self._spinner(surf, r.center, r.w // 2 - 13, ACCENT)
+        else:
+            self._blit_icon(surf, icon, r.center, 26, color)
+
+    def _draw_tile(self, surf, r, label, icon, active, state, busy):
+        """Quick-settings tile: icon disc, name, state."""
+        self._glass(surf, r, 20, active=active)
+        cx, cy = r.x + 38, r.y + 38
+        self._disc(surf, (cx, cy), 23, ACCENT if active else SURFACE_3)
+        if busy:
+            self._spinner(surf, (cx, cy), 12, SURFACE_0 if active else ACCENT)
+        else:
+            self._blit_icon(surf, icon, (cx, cy), 28, SURFACE_0 if active else TEXT_HI)
+        surf.blit(self._text(self.f_body_b, label, TEXT_HI), (r.x + 16, r.bottom - 50))
+        state = self._fit(self.f_caption, state, r.w - 28)
+        surf.blit(self._text(self.f_caption, state, ACCENT if active else TEXT_MID), (r.x + 16, r.bottom - 26))
+
+    def _draw_action(self, surf, r, label, icon, tone):
+        self._glass(surf, r, 18)
+        cx, cy = r.x + 32, r.centery
+        self._disc(surf, (cx, cy), 18, (*tone, 64))
+        self._blit_icon(surf, icon, (cx, cy), 24, tone)
+        text = self._text(self.f_body_b, label, TEXT_HI)
+        surf.blit(text, text.get_rect(midleft=(r.x + 60, cy)))
+
+    def _menu_subtitle(self):
+        net = self.net
+        if net.get("hotspot"):
+            return f"{self.hostname} · hotspot {HOTSPOT_IP}"
+        if net.get("ip"):
+            return f"{self.hostname} · {net['ip']}"
+        if net.get("server") is None:
+            return self.hostname
+        return f"{self.hostname} · nessuna rete"
+
+    def _render_menu(self, surf):
+        """System menu: toggles, power actions and how to reach the web remote."""
+        W, H = self.width, self.height
+        m, gap = 22, 14
+        net = self.net
+        self._header(surf, "Impostazioni", self._menu_subtitle(), right=("close", self._close_overlay, False))
+
+        server, hotspot, wifi = net.get("server"), net.get("hotspot"), net.get("wifi")
+
+        def state(on, on_text, off_text):
+            return "…" if on is None else (on_text if on else off_text)
+
+        ssid = (self._hotspot_credentials or (HOTSPOT_SSID, ""))[0]
+        tiles = (
+            ("Server web", "globe", bool(server), self._busy.get("server") or state(server, "Attivo", "Spento"),
+             "server" in self._busy, self.toggle_server),
+            ("Hotspot", "hotspot", bool(hotspot), self._busy.get("hotspot") or state(hotspot, ssid, "Spento"),
+             "hotspot" in self._busy, self.toggle_hotspot),
+            ("Wi-Fi", "wifi", bool(wifi), self._busy.get("wifi") or wifi or state(hotspot, "Non connessa", "Non connessa"),
+             "wifi" in self._busy, lambda: self._open_overlay("wifi")),
+        )
+        top = 86
+        th = max(96, int(H * 0.235))
+        tw = (W - 2 * m - 2 * gap) // 3
+        for i, (label, icon, active, text, busy, action) in enumerate(tiles):
+            r = pygame.Rect(m + i * (tw + gap), top, tw, th)
+            self._draw_tile(surf, r, label, icon, active, text, busy)
+            self._hit(r, action, 20)
+
+        top2 = top + th + gap
+        bh = 58
+        actions = (
+            ("Standby", "moon", INFO, self._standby_from_menu),
+            ("Riavvia", "reboot", ACCENT, lambda: self._ask(
+                "Riavviare la fotocamera?", "Torna operativa in circa mezzo minuto.",
+                "reboot", ACCENT, "Riavvia", self._reboot)),
+            ("Spegni", "power", DANGER, lambda: self._ask(
+                "Spegnere la fotocamera?",
+                "Per riaccenderla scollega e ricollega l'alimentazione.",
+                "power", DANGER, "Spegni", self._shutdown)),
+        )
+        for i, (label, icon, tone, action) in enumerate(actions):
+            r = pygame.Rect(m + i * (tw + gap), top2, tw, bh)
+            self._draw_action(surf, r, label, icon, tone)
+            self._hit(r, action, 18)
+
+        top3 = top2 + bh + gap
+        card = pygame.Rect(m, top3, W - 2 * m, H - top3 - 16)
+        if card.h >= 110:
+            self._draw_connection_card(surf, card)
+
+    def _draw_connection_card(self, surf, card):
+        """How to open the web remote: URL and QR code (plus the hotspot's Wi-Fi QR)."""
+        self._glass(surf, card, 20)
+        net = self.net
+        pad = 13
+        tx = card.x + 22
+
+        def message(icon, title, body):
+            cx = card.x + 46
+            self._disc(surf, (cx, card.centery), 24, (255, 255, 255, 22))
+            self._blit_icon(surf, icon, (cx, card.centery), 28, TEXT_MID)
+            x = cx + 40
+            y = card.centery - 30
+            surf.blit(self._text(self.f_body_b, title, TEXT_HI), (x, y))
+            self._blit_lines(surf, self.f_caption, body, TEXT_MID, (x, y + 28), card.right - x - 18)
+
+        if net.get("server") is None:
+            return
+        if not net.get("server"):
+            message("globe", "Server web spento",
+                    "Attivalo per usare la galleria e il telecomando dal telefono.")
+            return
+        ip = net.get("ip")
+        if not ip:
+            message("wifi", "Nessuna rete",
+                    "Collegati a una rete Wi-Fi o attiva l'hotspot per usare il telecomando.")
+            return
+
+        url = f"http://{ip}:{SERVER_PORT}/live"
+        qr_box = card.h - 2 * pad
+        if net.get("hotspot"):
+            ssid, password = self._hotspot_credentials or (HOTSPOT_SSID, HOTSPOT_PASSWORD)
+
+            def esc(s):
+                return "".join("\\" + ch if ch in '\\;,:"' else ch for ch in s)
+
+            codes = ((f"WIFI:T:WPA;S:{esc(ssid)};P:{esc(password)};;", "1 · RETE"), (url, "2 · PAGINA"))
+            tile = max(len(self._qr(text)) for text, _ in codes)
+            x = card.x + pad
+            for text, caption in codes:
+                q = self._qr_surface(text, qr_box - 18, tile)
+                y = card.centery - (q.get_height() + 18) // 2
+                surf.blit(q, (x, y))
+                self.draw_label(surf, caption, (x + q.get_width() // 2, y + q.get_height() + 11),
+                                color=TEXT_MID)
+                x += q.get_width() + 14
+            tx = x + 6
+            y = card.centery - 64
+            self.draw_label(surf, "HOTSPOT", (tx + self._label_width("HOTSPOT") // 2, y + 6), color=TEXT_LOW)
+            surf.blit(self._text(self.f_body_b, self._fit(self.f_body_b, ssid, card.right - tx - 14), TEXT_HI),
+                      (tx, y + 20))
+            y = self._blit_lines(surf, self.f_caption, f"Password {password}", TEXT_MID, (tx, y + 46),
+                                 card.right - tx - 14)
+            self._blit_lines(surf, self.f_caption, f"Poi apri {ip}:{SERVER_PORT}/live", TEXT_MID,
+                             (tx, y + 6), card.right - tx - 14)
+            return
+
+        q = self._qr_surface(url, qr_box)
+        surf.blit(q, (card.x + pad, card.centery - q.get_height() // 2))
+        tx = card.x + pad + q.get_width() + 20
+        y = card.centery - 54
+        self.draw_label(surf, "TELECOMANDO", (tx + self._label_width("TELECOMANDO") // 2, y + 6), color=TEXT_LOW)
+        surf.blit(self._text(self.f_heading, f"{ip}:{SERVER_PORT}", TEXT_HI), (tx, y + 20))
+        self._blit_lines(surf, self.f_caption,
+                         "Inquadra il codice con il telefono: anteprima dal vivo, scatto e galleria.",
+                         TEXT_MID, (tx, y + 56), card.right - tx - 16)
+
+    def _label_width(self, text, tracking=1):
+        return sum(self.micro_font.size(c)[0] for c in text) + tracking * (len(text) - 1)
+
+    def _standby_from_menu(self):
+        self._close_overlay()
+        self.enter_standby()
+
+    def _shutdown(self):
+        print("Shutdown requested from the menu")
+        self._shutdown_text = "Spegnimento…"
+        self._open_overlay("shutdown")
+        self._present(self._overlay_surface())
+        subprocess.Popen(['sudo', 'shutdown', 'now'])
+
+    def _reboot(self):
+        print("Reboot requested from the menu")
+        self._shutdown_text = "Riavvio…"
+        self._open_overlay("shutdown")
+        self._present(self._overlay_surface())
+        subprocess.Popen(['sudo', 'reboot'])
+
+    def _render_shutdown(self, surf):
+        surf.fill(BLACK)
+        cx, cy = self.width // 2, self.height // 2
+        self._blit_icon(surf, "power", (cx, cy - 46), 56, TEXT_MID)
+        title = self._text(self.f_heading, self._shutdown_text, TEXT_HI)
+        surf.blit(title, title.get_rect(center=(cx, cy + 14)))
+        self._blit_lines(surf, self.f_caption, "Attendi qualche secondo prima di scollegare l'alimentazione.",
+                         TEXT_MID, (cx, cy + 40), self.width - 120, center=True)
+
+    def _render_wifi(self, surf):
+        W, H = self.width, self.height
+        m = 22
+        net = self.net
+        connecting = self._connecting_ssid if "wifi" in self._busy else None
+        if connecting:
+            sub = f"Connessione a {connecting}…"
+        elif net.get("hotspot"):
+            sub = "Hotspot attivo: si spegne se ti colleghi a una rete"
+        elif net.get("wifi"):
+            sub = f"Connessa a {net['wifi']}"
+        else:
+            sub = "Scegli una rete"
+        self._header(surf, "Wi-Fi", sub, back=lambda: self._open_overlay("menu"),
+                     right=("refresh", self.scan_wifi_networks, self.wifi_scanning))
+
+        nets = self.wifi_networks
+        top = 86
+        if not nets:
+            card = pygame.Rect(m, top, W - 2 * m, 150)
+            self._glass(surf, card, 20)
+            if self.wifi_scanning:
+                self._spinner(surf, (card.centerx, card.y + 52), 16, ACCENT)
+                text = self._text(self.f_body, "Ricerca reti…", TEXT_MID)
+                surf.blit(text, text.get_rect(center=(card.centerx, card.y + 104)))
+            else:
+                text = self._text(self.f_body_b, "Nessuna rete trovata", TEXT_HI)
+                surf.blit(text, text.get_rect(center=(card.centerx, card.y + 56)))
+                hint = self._text(self.f_caption, "Tocca il pulsante in alto a destra per cercare di nuovo", TEXT_MID)
+                surf.blit(hint, hint.get_rect(center=(card.centerx, card.y + 88)))
+            return
+
+        row_h = 58
+        max_rows = max(2, (H - top - 16) // row_h)
+        per_page = max_rows if len(nets) <= max_rows else max_rows - 1
+        pages = (len(nets) + per_page - 1) // per_page
+        page = min(self.wifi_page, pages - 1)
+        visible = nets[page * per_page:(page + 1) * per_page]
+        card = pygame.Rect(m, top, W - 2 * m, row_h * len(visible))
+        self._glass(surf, card, 18)
+        connected = net.get("wifi")
+        saved = self.wifi_saved
+        for i, n in enumerate(visible):
+            r = pygame.Rect(card.x, card.y + i * row_h, card.w, row_h)
+            if i:
+                self._rrect(surf, (r.x + 58, r.y, r.w - 58, 1), (255, 255, 255, 26), 0)
+            level = max(1, min(4, 1 + n["signal"] // 25))
+            self._blit_icon(surf, "wifi", (r.x + 30, r.centery), 28, TEXT_HI, level)
+            is_conn = n["ssid"] == connected
+            secured = n["security"] != "Open"
+            name = self._fit(self.f_body_b, n["ssid"], r.w - 150)
+            surf.blit(self._text(self.f_body_b, name, TEXT_HI), (r.x + 58, r.y + 8))
+            if n["ssid"] == connecting:
+                detail, color = "Connessione…", ACCENT
+            elif is_conn:
+                detail, color = "Connessa", ACCENT
+            elif n["ssid"] in saved:
+                detail, color = "Salvata", TEXT_MID
+            else:
+                detail, color = ("Protetta · " + n["security"].replace(" ", " / ")) if secured else "Aperta", TEXT_MID
+            surf.blit(self._text(self.f_caption, detail, color), (r.x + 58, r.y + 33))
+            if n["ssid"] == connecting:
+                self._spinner(surf, (r.right - 30, r.centery), 10, ACCENT)
+            elif is_conn:
+                self._blit_icon(surf, "check", (r.right - 30, r.centery), 26, ACCENT)
+            elif secured:
+                self._blit_icon(surf, "lock", (r.right - 30, r.centery), 22, TEXT_LOW)
+            self._hit(r, lambda n=n: self._select_network(n), 0 if 0 < i < len(visible) - 1 else 18)
+
+        if pages > 1:
+            bar = pygame.Rect(m, card.bottom + 10, W - 2 * m, 46)
+            prev_r = pygame.Rect(bar.x, bar.y, 120, bar.h)
+            next_r = pygame.Rect(bar.right - 120, bar.y, 120, bar.h)
+            for r, icon, enabled, delta in ((prev_r, "up", page > 0, -1), (next_r, "down", page < pages - 1, 1)):
+                self._glass(surf, r, 16, strength=1.0 if enabled else 0.4)
+                self._blit_icon(surf, icon, r.center, 24, TEXT_HI if enabled else TEXT_LOW)
+                if enabled:
+                    self._hit(r, lambda d=delta: self._wifi_page(d), 16)
+            text = self._text(self.f_caption, f"{page * per_page + 1}–{page * per_page + len(visible)} di {len(nets)}",
+                              TEXT_MID)
+            surf.blit(text, text.get_rect(center=bar.center))
+
+    def _wifi_page(self, delta):
+        self.wifi_page = max(0, self.wifi_page + delta)
+
+    def _select_network(self, n):
+        ssid = n["ssid"]
+        if ssid == self.net.get("wifi") or "wifi" in self._busy:
+            return
+        print(f"Selected network: {ssid} ({n['security']})")
+        if n["security"] == "Open" or ssid in self.wifi_saved:
+            self._connecting_ssid = ssid
+            self.connect_to_wifi(ssid)
+        else:
+            self.password_network = n
+            self.password_input = ""
+            self.password_visible = False
+            self.keyboard_shift = 0
+            self.keyboard_symbols = False
+            self._open_overlay("password")
+
+    # Keyboard rows: (key id, label, width in key units)
+    def _keyboard_rows(self):
+        bottom = [("MODE", "ABC" if self.keyboard_symbols else "?123", 1.6), (",", ",", 1),
+                  ("SPACE", "spazio", 4), (".", ".", 1), ("OK", "Connetti", 2.4)]
+        if self.keyboard_symbols:
+            return [
+                [(c, c, 1) for c in "1234567890"],
+                [(c, c, 1) for c in "!@#$%^&*()"],
+                [(c, c, 1) for c in "-_=+[]{}\\|~"],
+                [(c, c, 1) for c in ";:'\"`<>/?"] + [("BACK", "", 1.5)],
+                bottom,
+            ]
+
+        def letters(s):
+            return [((c.upper() if self.keyboard_shift else c),) * 2 + (1,) for c in s]
+
+        return [
+            [(c, c, 1) for c in "1234567890"],
+            letters("qwertyuiop"),
+            letters("asdfghjkl"),
+            [("SHIFT", "", 1.5)] + letters("zxcvbnm") + [("BACK", "", 1.5)],
+            bottom,
+        ]
+
+    def _keyboard_layout(self, top, bottom):
+        """Key rects: plain rows keep a common key width (centred), rows with wide keys span the width."""
+        W = self.width
+        margin, gap = 10, 6
+        avail = W - 2 * margin
+        rows = self._keyboard_rows()
+        key_h = (bottom - top - (len(rows) - 1) * gap) // len(rows)
+        base_u = (avail - 9 * gap) / 10
+        out = []
+        for ri, row in enumerate(rows):
+            y = top + ri * (key_h + gap)
+            units = sum(k[2] for k in row)
+            plain = all(k[2] == 1 for k in row)
+            if plain and units <= 10:
+                u = base_u
+            else:
+                u = (avail - (len(row) - 1) * gap) / units
+            width = u * units + gap * (len(row) - 1)
+            x = margin + (avail - width) / 2
+            for kid, label, kw in row:
+                w = u * kw
+                out.append((kid, label, pygame.Rect(round(x), y, round(w), key_h)))
+                x += w + gap
+        return out
+
+    def _render_password(self, surf):
+        W, H = self.width, self.height
+        net = self.password_network or {"ssid": ""}
+        busy = "wifi" in self._busy
+        self._header(surf, "Password", net["ssid"], back=lambda: self._open_overlay("wifi"))
+
+        field = pygame.Rect(22, 82, W - 44 - 62, 52)
+        self._rrect(surf, field, (0, 0, 0, 90), 14)
+        self._rrect(surf, field, (*ACCENT, 170), 14, width=1)
+        eye = pygame.Rect(field.right + 10, field.y, 52, 52)
+        self._glass(surf, eye, 14)
+        self._blit_icon(surf, "eye_off" if self.password_visible else "eye", eye.center, 28, TEXT_HI)
+        self._hit(eye, self._toggle_password_visibility, 14)
+
+        pw = self.password_input
+        x, cy = field.x + 16, field.centery
+        inner_w = field.w - 40
+        if not pw:
+            hint = self._text(self.f_body, "Inserisci la password", TEXT_LOW)
+            surf.blit(hint, hint.get_rect(midleft=(x + 6, cy)))
+        elif self.password_visible:
+            shown = pw
+            while self.f_body_b.size(shown)[0] > inner_w:
+                shown = shown[1:]
+            text = self.f_body_b.render(shown, True, TEXT_HI)
+            surf.blit(text, text.get_rect(midleft=(x, cy)))
+            x += text.get_width() + 3
+        else:
+            # Dots, with the last character readable for a second after typing it
+            reveal = time.monotonic() - self._last_key_time < 1.0
+            last = self.f_body_b.render(pw[-1], True, TEXT_HI) if reveal else None
+            slots = (inner_w - (last.get_width() + 6 if last else 0)) // 16
+            dots = len(pw) - (1 if last else 0)
+            for _ in range(min(dots, slots)):
+                self._disc(surf, (x + 6, cy), 5, TEXT_HI)
+                x += 16
+            if last:
+                surf.blit(last, last.get_rect(midleft=(x, cy)))
+                x += last.get_width() + 3
+        if int(time.monotonic() * 2) % 2 == 0:
+            pygame.draw.rect(surf, ACCENT, (x + 2, cy - 13, 2, 26))
+
+        keys = self._keyboard_layout(150, H - 10)
+        for kid, label, r in keys:
+            if kid == "OK":
+                enabled = bool(pw) and not busy
+                self._rrect(surf, r, ACCENT if enabled else (*ACCENT, 90), 12)
+                if busy:
+                    self._spinner(surf, r.center, 11, SURFACE_0)
+                else:
+                    text = self._text(self.f_body_b, label, SURFACE_0)
+                    surf.blit(text, text.get_rect(center=r.center))
+            else:
+                special = kid in ("SHIFT", "BACK", "MODE")
+                on = kid == "SHIFT" and self.keyboard_shift
+                self._rrect(surf, r, (255, 255, 255, 64 if on else 13 if special else 28), 12)
+                if kid == "SHIFT":
+                    self._blit_icon(surf, "shift", r.center, 26, TEXT_HI, self.keyboard_shift)
+                elif kid == "BACK":
+                    self._blit_icon(surf, "backspace", r.center, 28, TEXT_HI)
+                elif kid in ("MODE", "SPACE"):
+                    text = self._text(self.f_caption_b if kid == "MODE" else self.f_caption, label,
+                                      TEXT_HI if kid == "MODE" else TEXT_MID)
+                    surf.blit(text, text.get_rect(center=r.center))
+                else:
+                    text = self._text(self.f_key, label, TEXT_HI)
+                    surf.blit(text, text.get_rect(center=r.center))
+            self._hit(r, lambda kid=kid: self._key(kid), 12)
+
+    def _toggle_password_visibility(self):
+        self.password_visible = not self.password_visible
+
+    def _key(self, kid):
+        now = time.monotonic()
+        if kid == "BACK":
+            self.password_input = self.password_input[:-1]
+        elif kid == "SHIFT":
+            # Tap: next letter upper case; double tap: caps lock
+            if self.keyboard_shift == 1 and now - self._last_shift_tap < 0.45:
+                self.keyboard_shift = 2
+            else:
+                self.keyboard_shift = 0 if self.keyboard_shift else 1
+            self._last_shift_tap = now
+        elif kid == "MODE":
+            self.keyboard_symbols = not self.keyboard_symbols
+        elif kid == "OK":
+            self._submit_password()
+        elif len(self.password_input) < 63:
+            self.password_input += " " if kid == "SPACE" else kid
+            self._last_key_time = now
+            if self.keyboard_shift == 1 and kid.isalpha():
+                self.keyboard_shift = 0
+
+    def _submit_password(self):
+        net = self.password_network
+        pw = self.password_input
+        if not net or not pw or "wifi" in self._busy:
+            return
+        if "WPA" in net["security"] and len(pw) < 8:
+            self._show_toast("La password Wi-Fi ha almeno 8 caratteri", "danger")
+            return
+        print(f"Connecting to {net['ssid']} with password...")
+        self._connecting_ssid = net["ssid"]
+        self.connect_to_wifi(net["ssid"], pw)
+
+    def _render_confirm(self, surf):
+        c = self._confirm
+        W, H = self.width, self.height
+        # Tapping outside the dialog cancels it
+        self._hit(pygame.Rect(0, 0, W, H), self._cancel_confirm, None)
+        panel = pygame.Rect(0, 0, min(468, W - 40), 252)
+        panel.center = (W // 2, H // 2)
+        for i in range(1, 9):
+            self._rrect(surf, panel.inflate(i * 3, i * 3).move(0, 6), (0, 0, 0, 14), 26 + i)
+        self._rrect(surf, panel, (*SURFACE_1, 248), 26)
+        self._rrect(surf, panel, (255, 255, 255, 36), 26, width=1)
+        self._hit(panel, lambda: None, None)
+        tone = c["tone"]
+        cx = panel.centerx
+        self._disc(surf, (cx, panel.y + 50), 30, (*tone, 60))
+        self._blit_icon(surf, c["icon"], (cx, panel.y + 50), 32, tone)
+        title = self._text(self.f_heading, c["title"], TEXT_HI)
+        surf.blit(title, title.get_rect(center=(cx, panel.y + 104)))
+        self._blit_lines(surf, self.f_caption, c["body"], TEXT_MID, (cx, panel.y + 126), panel.w - 64,
+                         center=True, max_lines=2)
+        bw = (panel.w - 3 * 18) // 2
+        cancel = pygame.Rect(panel.x + 18, panel.bottom - 72, bw, 54)
+        ok = pygame.Rect(cancel.right + 18, cancel.y, bw, 54)
+        self._glass(surf, cancel, 16, strength=1.4)
+        text = self._text(self.f_body_b, "Annulla", TEXT_HI)
+        surf.blit(text, text.get_rect(center=cancel.center))
+        self._rrect(surf, ok, tone, 16)
+        text = self._text(self.f_body_b, c["ok"], WHITE if tone == DANGER else SURFACE_0)
+        surf.blit(text, text.get_rect(center=ok.center))
+        self._hit(cancel, self._cancel_confirm, 16)
+        self._hit(ok, self._run_confirm, 16)
+
+    def _run_confirm(self):
+        action = self._confirm["action"]
+        back = self._confirm["back"]
+        self._confirm = None
+        if back:
+            self._open_overlay(back)
+        else:
+            self._close_overlay()
+        action()
+
+    def _saving_frame(self):
+        """The last viewfinder frame, dimmed, with a "saving" badge (shown during a capture)."""
+        surf = self._ui_surface.copy()
+        surf.fill((120, 120, 120), special_flags=pygame.BLEND_RGB_MULT)
+        badge = self._chip_surface("Salvataggio…", "camera", TEXT_HI)
+        surf.blit(badge, badge.get_rect(center=self.image_rect.center))
+        return surf
+
+    # ---------------- gallery ----------------
+
+    def _photo_caption(self, path, exif):
+        """'16 ott 2026, 18:26 · 1/15 s · ISO 813' from EXIF, falling back to the file name."""
+        months = ("gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic")
+        parts = []
+        sub = exif.get_ifd(0x8769) if exif else {}
+        stamp = sub.get(36867) or (exif.get(306) if exif else None)
+        try:
+            dt = datetime.strptime(str(stamp), "%Y:%m:%d %H:%M:%S")
+        except (TypeError, ValueError):
             try:
-                # Load photo with proper aspect ratio preservation
-                photo_path = self.photos[self.gallery_index]
-                img = _pil_image().open(photo_path)
-                
-                # More generous display area - reduce margins
-                display_w = self.width - 40   # 20px margin on each side
-                display_h = self.height - 80  # 40px top (for counter) + 40px bottom
-                
-                # Calculate scaling to fit within display while maintaining aspect ratio
-                # Use object-fit: contain logic
-                img_w, img_h = img.size
-                
-                # Calculate scale factor (fit to contain)
-                scale_x = display_w / img_w
-                scale_y = display_h / img_h
-                scale = min(scale_x, scale_y)
-                
-                # Calculate new dimensions
-                new_w = int(img_w * scale)
-                new_h = int(img_h * scale)
-                
-                # Resize with high-quality resampling
-                img_resized = img.resize((new_w, new_h), _pil_image().Resampling.LANCZOS)
-                
-                # Convert to pygame
-                mode = img_resized.mode
-                size = img_resized.size
-                data = img_resized.tobytes()
-                photo_surf = pygame.image.fromstring(data, size, mode)
-                
-                # Center the image
-                photo_rect = photo_surf.get_rect(center=(self.width // 2, self.height // 2))
-                gallery_surf.blit(photo_surf, photo_rect)
-                
-                # Debug overlay if enabled
-                if DEBUG_MODE:
-                    debug_text = f"Orig: {img_w}x{img_h} | Scaled: {new_w}x{new_h} | Scale: {scale:.2f}"
-                    debug_surf = self.small_font.render(debug_text, True, YELLOW)
-                    gallery_surf.blit(debug_surf, (10, self.height - 30))
-                    
+                dt = datetime.strptime(path.stem[-15:], "%Y%m%d_%H%M%S")
+            except ValueError:
+                dt = datetime.fromtimestamp(path.stat().st_mtime)
+        parts.append(f"{dt.day} {months[dt.month - 1]} {dt.year}, {dt:%H:%M}")
+        exposure = sub.get(33434)
+        if exposure:
+            exposure = float(exposure)
+            parts.append(f"1/{round(1 / exposure)} s" if exposure < 0.5 else f"{exposure:.1f} s")
+        iso = sub.get(34855)
+        if iso:
+            parts.append(f"ISO {iso}")
+        return " · ".join(parts)
+
+    def _decode_photo(self, path):
+        """Decode a photo at screen size: JPEG draft mode decodes at 1/4 scale directly.
+
+        The old gallery decoded the full 12 MP file and resized it with Lanczos
+        on every frame, i.e. a second or more per frame on a Pi Zero 2W.
+        """
+        Image = _pil_image()
+        with Image.open(path) as im:
+            exif = im.getexif()
+            im.draft("RGB", (self.width, self.height))
+            img = im.convert("RGB")
+        img.thumbnail((self.width, self.height), Image.Resampling.BILINEAR)
+        return {"pixels": img.tobytes(), "size": img.size, "caption": self._photo_caption(path, exif),
+                "surface": None}
+
+    def _gallery_entry(self, path):
+        with self._gallery_lock:
+            entry = self._gallery_cache.get(path)
+        if entry is None:
+            try:
+                entry = self._decode_photo(path)
             except Exception as e:
                 print(f"Gallery load error: {e}")
-                error_text = self.small_font.render(f"Errore: {str(e)[:40]}", True, RED)
-                gallery_surf.blit(error_text, (10, self.height // 2))
-                
-        # Top scrim so the chrome stays legible over bright photos
-        scrim = pygame.Surface((self.width, 78), pygame.SRCALPHA)
-        for i in range(78):
-            alpha = int(180 * (1 - i / 78) ** 1.6)
-            pygame.draw.line(scrim, (0, 0, 0, alpha), (0, i), (self.width, i))
-        gallery_surf.blit(scrim, (0, 0))
+                return None
+            with self._gallery_lock:
+                self._gallery_cache[path] = entry
+        if entry["surface"] is None:
+            entry["surface"] = pygame.image.frombuffer(entry["pixels"], entry["size"], "RGB")
+        return entry
 
-        # Counter as a pill (hidden when empty: it used to read "1 / 0")
-        if self.photos:
-            counter = f"{self.gallery_index + 1} / {len(self.photos)}"
-            counter_surf = self.small_bold_font.render(counter, True, TEXT_HI)
-            pill = counter_surf.get_rect(center=(self.width // 2, 24)).inflate(20, 10)
-            pygame.draw.rect(gallery_surf, SURFACE_2, pill, border_radius=pill.height // 2)
-            gallery_surf.blit(counter_surf, counter_surf.get_rect(center=pill.center))
+    def _prefetch_gallery(self):
+        """Decode the neighbours in the background so swiping is instant."""
+        wanted = []
+        for d in (1, -1, 2):
+            if self.photos:
+                wanted.append(self.photos[(self.gallery_index + d) % len(self.photos)])
+        current = self.photos[self.gallery_index] if self.photos else None
+        with self._gallery_lock:
+            keep = set(wanted) | {current}
+            for path in [p for p in self._gallery_cache if p not in keep]:
+                if len(self._gallery_cache) <= 5:
+                    break
+                del self._gallery_cache[path]
+            todo = [p for p in wanted if p not in self._gallery_cache and p not in self._gallery_loading]
+            self._gallery_loading.update(todo)
 
-        # Back button with icon
-        pygame.draw.rect(gallery_surf, SURFACE_2, self.back_btn_rect, border_radius=12)
-        if self.icons is None:
-            self.load_icons()
-        if "back" in self.icons:
-            icon_rect = self.icons["back"].get_rect(center=self.back_btn_rect.center)
-            gallery_surf.blit(self.icons["back"], icon_rect)
+        def load(paths):
+            for path in paths:
+                try:
+                    entry = self._decode_photo(path)
+                    with self._gallery_lock:
+                        self._gallery_cache[path] = entry
+                except Exception as e:
+                    print(f"Gallery prefetch error: {e}")
+                finally:
+                    with self._gallery_lock:
+                        self._gallery_loading.discard(path)
+
+        if todo:
+            threading.Thread(target=load, args=(todo,), daemon=True).start()
+
+    def _gallery_scrims(self):
+        cached = self._scrims
+        if cached is None:
+            top = pygame.Surface((self.width, 90), pygame.SRCALPHA)
+            for i in range(90):
+                pygame.draw.line(top, (0, 0, 0, int(170 * (1 - i / 90) ** 1.6)), (0, i), (self.width, i))
+            bottom = pygame.transform.flip(top, False, True)
+            cached = self._scrims = (top, bottom)
+        return cached
+
+    def draw_gallery_ui(self):
+        """Gallery frame, drawn the right way up (photo plus controls over it)."""
+        W, H = self.width, self.height
+        surf = pygame.Surface((W, H))
+        surf.fill(SURFACE_0)
+        entry = None
+        if not self.photos:
+            self._blit_icon(surf, "camera", (W // 2, H // 2 - 52), 64, TEXT_LOW)
+            text = self._text(self.f_heading, "Nessuna foto", TEXT_MID)
+            surf.blit(text, text.get_rect(center=(W // 2, H // 2 + 6)))
+            hint = self._text(self.f_caption, "Scatta con il pulsante per iniziare", TEXT_LOW)
+            surf.blit(hint, hint.get_rect(center=(W // 2, H // 2 + 36)))
         else:
-            # Chevron-left drawn to match the sidebar arrows
-            cx, cy = self.back_btn_rect.center
-            pygame.draw.lines(gallery_surf, TEXT_HI, False,
-                              [(cx + 5, cy - 9), (cx - 5, cy), (cx + 5, cy + 9)], 2)
+            self.gallery_index %= len(self.photos)
+            entry = self._gallery_entry(self.photos[self.gallery_index])
+            if entry:
+                surf.blit(entry["surface"], entry["surface"].get_rect(center=(W // 2, H // 2)))
+            else:
+                text = self._text(self.f_body, "Impossibile aprire la foto", DANGER)
+                surf.blit(text, text.get_rect(center=(W // 2, H // 2)))
+            self._prefetch_gallery()
 
-        # Trash button (Top Right)
-        pygame.draw.rect(gallery_surf, DANGER, self.trash_btn_rect, border_radius=12)
-        self.draw_icon(gallery_surf, "trash", self.trash_btn_rect.center, size=24, color=WHITE)
+        top, bottom = self._gallery_scrims()
+        surf.blit(top, (0, 0))
+        surf.blit(bottom, (0, H - bottom.get_height()))
 
-        # Ruota 180
-        rotated_gallery = pygame.transform.rotate(gallery_surf, 180)
-        self.screen.blit(rotated_gallery, (0, 0))
+        for rect, icon, color in ((self.back_btn_rect, "back", TEXT_HI),
+                                  (self.trash_btn_rect, "trash", (255, 128, 128))):
+            if icon == "trash" and not self.photos:
+                continue
+            self._disc(surf, rect.center, rect.w // 2, (0, 0, 0, 120))
+            gfxdraw.aacircle(surf, rect.centerx, rect.centery, rect.w // 2, (255, 255, 255, 60))
+            self._blit_icon(surf, icon, rect.center, 28, color)
+
+        if self.photos:
+            counter = self._text(self.f_caption_b, f"{self.gallery_index + 1} / {len(self.photos)}", TEXT_HI)
+            pill = counter.get_rect(center=(W // 2, self.back_btn_rect.centery)).inflate(26, 14)
+            self._rrect(surf, pill, (0, 0, 0, 120), pill.h // 2)
+            surf.blit(counter, counter.get_rect(center=pill.center))
+            if len(self.photos) > 1:
+                self._blit_icon(surf, "back", (22, H // 2), 30, (255, 255, 255, 150))
+                self._blit_icon(surf, "next", (W - 22, H // 2), 30, (255, 255, 255, 150))
+        if entry:
+            caption = self._text(self.f_caption, entry["caption"], TEXT_HI)
+            pill = caption.get_rect(center=(W // 2, H - 30)).inflate(28, 14)
+            self._rrect(surf, pill, (0, 0, 0, 130), pill.h // 2)
+            surf.blit(caption, caption.get_rect(center=pill.center))
+
+        toast = self._active_toast()
+        if toast:
+            pill = self._toast_surface(toast[0], toast[1])
+            surf.blit(pill, pill.get_rect(center=(W // 2, H - 78)))
+        self._gallery_logical = surf
+        return surf
+
+    def _gallery_surface(self):
+        path = self.photos[self.gallery_index % len(self.photos)] if self.photos else None
+        with self._gallery_lock:
+            loaded = path in self._gallery_cache
+        toast = self._active_toast()
+        sig = (path, loaded, len(self.photos), toast[:2] if toast else None)
+        if self._gallery_frame is None or self._gallery_frame[0] != sig:
+            self._gallery_frame = (sig, pygame.transform.rotate(self.draw_gallery_ui(), 180))
+        return self._gallery_frame[1]
+
+    def _confirm_delete(self):
+        self.delete_photo()
+        self._gallery_frame = None
+
+    # ---------------- input ----------------
 
     def calibrate_touch(self, raw_x, raw_y):
         """Calibra coordinate touch grezze a coordinate schermo"""
         cal = self.touch_cal
-        
+
         # Swap XY se necessario
         if cal['swap_xy']:
             raw_x, raw_y = raw_y, raw_x
-        
+
         # Normalizza 0-1
         x_norm = (raw_x - cal['x_min']) / (cal['x_max'] - cal['x_min'])
         y_norm = (raw_y - cal['y_min']) / (cal['y_max'] - cal['y_min'])
-        
+
         # Inverti se necessario
         if cal['invert_x']:
             x_norm = 1.0 - x_norm
         if cal['invert_y']:
             y_norm = 1.0 - y_norm
-        
+
         # Clamp 0-1
         x_norm = max(0, min(1, x_norm))
         y_norm = max(0, min(1, y_norm))
-        
+
         # Scala a risoluzione schermo
         screen_x = int(x_norm * self.width)
         screen_y = int(y_norm * self.height)
-        
+
         return screen_x, screen_y
+
+    def _on_tap(self, pos):
+        """Any touch wakes the camera from standby; otherwise it is a tap on the UI."""
+        if self.standby_mode:
+            self.wake_from_standby()
+        else:
+            self.handle_touch(pos)
 
     def handle_touch(self, pos):
         """Handle touch/click events"""
-        # Con display ruotato di 180, dobbiamo invertire X e Y 
+        # Con display ruotato di 180, dobbiamo invertire X e Y
         # per mappare il tocco visuale sul sistema di coordinate logico
         vx, vy = pos
         x = self.width - vx
         y = self.height - vy
         pos = (x, y)
-        
+
         # Debug Log
         print(f"DEBUG TOUCH: visual=({vx}, {vy}) logical=({x}, {y})")
-        
-        # Password popup handle (highest priority)
-        if self.show_password_popup:
-            # Keyboard layout dimensions (same as draw function)
-            kb_y = self.popup_rect.y + 105
-            key_w = int(28 * self.scale)
-            key_h = int(35 * self.scale)
-            key_gap = int(3 * self.scale)
-            
-            rows = [
-                ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
-                ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
-                ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l'],
-                ['⇧', 'z', 'x', 'c', 'v', 'b', 'n', 'm', '⌫']
-            ]
-            
-            # Check keyboard keys
-            for row_idx, row in enumerate(rows):
-                row_y = kb_y + row_idx * (key_h + key_gap)
-                row_width = len(row) * key_w + (len(row) - 1) * key_gap
-                start_x = self.popup_rect.centerx - row_width // 2
-                
-                for col_idx, key in enumerate(row):
-                    key_x = start_x + col_idx * (key_w + key_gap)
-                    key_rect = pygame.Rect(key_x, row_y, key_w, key_h)
-                    
-                    if key_rect.collidepoint(pos):
-                        if key == '⌫':  # Backspace
-                            self.password_input = self.password_input[:-1]
-                        elif key == '⇧':  # Shift
-                            self.keyboard_shift = not self.keyboard_shift
-                        else:
-                            # Add character
-                            char = key.upper() if self.keyboard_shift and key.isalpha() else key
-                            self.password_input += char
-                            # Auto-toggle shift after letter
-                            if key.isalpha():
-                                self.keyboard_shift = False
-                        return
-            
-            # Check space bar
-            space_y = kb_y + 4 * (key_h + key_gap)
-            space_w = int(key_w * 5)
-            space_rect = pygame.Rect(self.popup_rect.centerx - space_w // 2, space_y, space_w, key_h)
-            if space_rect.collidepoint(pos):
-                self.password_input += ' '
-                return
-            
-            # Check action buttons
-            btn_y = self.popup_rect.bottom - 60
-            btn_w = int(self.popup_rect.width * 0.4)
-            btn_h = 45
-            
-            connect_rect = pygame.Rect(self.popup_rect.x + 20, btn_y, btn_w, btn_h)
-            cancel_rect = pygame.Rect(self.popup_rect.right - btn_w - 20, btn_y, btn_w, btn_h)
-            
-            if connect_rect.collidepoint(pos):
-                # Connect to network with password
-                if self.password_network and self.password_input:
-                    print(f"Connecting to {self.password_network['ssid']} with password...")
-                    success = self.connect_to_wifi(self.password_network['ssid'], self.password_input)
-                    if success:
-                        self.show_password_popup = False
-                        self.show_wifi_popup = False
-                        self.password_input = ""
-                        self.password_network = None
-                return
-            
-            if cancel_rect.collidepoint(pos):
-                # Cancel password input
-                self.show_password_popup = False
-                self.show_wifi_popup = True
-                self.password_input = ""
-                self.password_network = None
-                return
-            
-            return
-        
-        # WiFi popup handle (priority over power popup)
-        if self.show_wifi_popup:
-            # Back button
-            back_rect = pygame.Rect(10, 10, 100, 50)
-            if back_rect.collidepoint(pos):
-                self.show_wifi_popup = False
-                self.show_power_popup = True
-                return
-            
-            # Network selection
-            list_y = self.popup_rect.y + 70
-            item_height = int(50 * self.scale)
-            
-            for i, network in enumerate(self.wifi_networks[:6]):
-                net_rect = pygame.Rect(self.popup_rect.x + 20, list_y + i * (item_height + 5), 
-                                      self.popup_rect.width - 40, item_height)
-                
-                if net_rect.collidepoint(pos):
-                    ssid = network['ssid']
-                    security = network['security']
-                    
-                    print(f"Selected network: {ssid} ({security})")
-                    
-                    # Connect to open or protected networks
-                    if security == '' or 'Open' in security or security == '--':
-                        print(f"Connecting to open network {ssid}...")
-                        success = self.connect_to_wifi(ssid)
-                        if success:
-                            self.show_wifi_popup = False
-                    else:
-                        # Password required - show password input
-                        print(f"Network {ssid} requires password - opening keyboard")
-                        self.password_network = network
-                        self.password_input = ""
-                        self.keyboard_shift = False
-                        self.show_wifi_popup = False
-                        self.show_password_popup = True
-                    return
-            return
-        
-        # Power popup handle
-        if self.show_power_popup:
-            if self.popup_shutdown_btn.collidepoint(pos):
-                subprocess.run(['sudo', 'shutdown', 'now'])
-            elif self.popup_standby_btn.collidepoint(pos):
-                if self.standby_mode:
-                    self.wake_from_standby()
-                else:
-                    self.enter_standby()
-                self.show_power_popup = False
-            elif self.popup_server_btn.collidepoint(pos):
-                self.toggle_server()
-            elif self.popup_hotspot_btn.collidepoint(pos):
-                self.toggle_hotspot()
-            elif self.popup_wifi_btn.collidepoint(pos):
-                print("Opening WiFi manager...")
-                self.show_power_popup = False
-                self.show_wifi_popup = True
-                threading.Thread(target=self.scan_wifi_networks, daemon=True).start()
-            elif self.popup_cancel_btn.collidepoint(pos):
-                self.show_power_popup = False
-            return
 
-        if self.mode == "camera":
-            # Priority to buttons in SIDEBARS
-            
-            # Left Sidebar Interaction
-            if x < self.sidebar_width:
-                # SHUTTER (Top)
-                if self.shutter_up_rect.collidepoint(x, y):
-                    self.current_shutter_index = (self.current_shutter_index + 1) % len(SHUTTER_SPEEDS)
-                    self.apply_camera_settings()
-                    return
-                elif self.shutter_down_rect.collidepoint(x, y):
-                    self.current_shutter_index = (self.current_shutter_index - 1) % len(SHUTTER_SPEEDS)
-                    self.apply_camera_settings()
-                    return
-                
-                # ISO (Bottom)
-                if self.iso_up_rect.collidepoint(x, y):
-                    self.current_iso_index = (self.current_iso_index + 1) % len(ISO_VALUES)
-                    self.apply_camera_settings()
-                    return
-                elif self.iso_down_rect.collidepoint(x, y):
-                    self.current_iso_index = (self.current_iso_index - 1) % len(ISO_VALUES)
-                    self.apply_camera_settings()
-                    return
-            
-            # Right Sidebar Interaction
-            elif x > self.width - self.sidebar_width:
-                # Power button (Top)
-                if self.power_rect.collidepoint(x, y):
-                    print("Power button pressed!")
-                    self.show_power_popup = True
-                    return
-
-                # Gallery button (Middle)
-                if self.gallery_rect.collidepoint(x, y):
-                    self.mode = "gallery"
-                    self.load_photos()
-                    return
-
-                # B/W Effect button
-                if self.bw_rect.collidepoint(x, y):
-                    self.grayscale_mode = not self.grayscale_mode
-                    print(f"B/W mode: {self.grayscale_mode}")
-                    self.apply_camera_settings()
-                    return
-                
-                # Focus Peaking toggle (Bottom)
-                if self.fp_rect.collidepoint(x, y):
-                    self.focus_peaking_mode = not self.focus_peaking_mode
-                    print(f"Focus peaking: {self.focus_peaking_mode}")
-                    return
-            
-            # Since preview is full screen, we remove the tap-preview check completely
-            # to avoid unintentional triggers with the 180 flip
-
+        if self.overlay is not None:
+            self._touch_overlay(pos)
+        elif self.mode == "camera":
+            self._touch_camera(pos)
         elif self.mode == "gallery":
-            # Back Button
-            if self.back_btn_rect.collidepoint(pos):
-                self.mode = "camera"
+            self._touch_gallery(pos)
+
+    def _touch_camera(self, pos):
+        x, y = pos
+        # Left Sidebar Interaction
+        if x < self.sidebar_width:
+            # SHUTTER (Top)
+            if self.shutter_up_rect.collidepoint(x, y):
+                self.current_shutter_index = (self.current_shutter_index + 1) % len(SHUTTER_SPEEDS)
+                self.apply_camera_settings()
+            elif self.shutter_down_rect.collidepoint(x, y):
+                self.current_shutter_index = (self.current_shutter_index - 1) % len(SHUTTER_SPEEDS)
+                self.apply_camera_settings()
+            # ISO (Bottom)
+            elif self.iso_up_rect.collidepoint(x, y):
+                self.current_iso_index = (self.current_iso_index + 1) % len(ISO_VALUES)
+                self.apply_camera_settings()
+            elif self.iso_down_rect.collidepoint(x, y):
+                self.current_iso_index = (self.current_iso_index - 1) % len(ISO_VALUES)
+                self.apply_camera_settings()
+            return
+
+        # Right Sidebar Interaction
+        if x > self.width - self.sidebar_width:
+            if self.power_rect.collidepoint(x, y):
+                print("Power button pressed!")
+                self._open_overlay("menu")
+            elif self.gallery_rect.collidepoint(x, y):
+                self.mode = "gallery"
+                self.load_photos()
+                self.gallery_index = 0  # newest first
+                self._gallery_frame = None
+            elif self.bw_rect.collidepoint(x, y):
+                self.grayscale_mode = not self.grayscale_mode
+                print(f"B/W mode: {self.grayscale_mode}")
+                self.apply_camera_settings()
+            elif self.fp_rect.collidepoint(x, y):
+                self.set_focus_assist(not self.focus_peaking_mode)
+            return
+
+        # The preview itself only reacts in focus-assist mode (a tap used to
+        # capture, and triggered by accident with the camera in hand).
+        if not self.focus_peaking_mode:
+            return
+        tb = self.toolbar
+        for name in ("zoom", "meter", "color", "level"):
+            r = tb[name]
+            # The whole height of the bar counts, not just the chip
+            if pygame.Rect(r.x, tb["bar"].y, r.w, tb["bar"].h).collidepoint(x, y):
+                if name == "zoom":
+                    self._cycle_zoom()
+                elif name == "meter":
+                    self._meter_peak = self._meter_value  # restart the peak hold
+                elif name == "color":
+                    self.peak_color_index = (self.peak_color_index + 1) % len(PEAK_COLORS)
+                    self._show_toast(f"Peaking {PEAK_COLORS[self.peak_color_index][0].lower()}", "accent", 1.2)
+                elif name == "level":
+                    self.peak_level_index = (self.peak_level_index + 1) % len(PEAK_LEVELS)
+                    self._show_toast(f"Sensibilità {PEAK_LEVELS[self.peak_level_index][0].lower()}",
+                                     "accent", 1.2)
                 return
-            
-            # Trash Button
-            if self.trash_btn_rect.collidepoint(pos):
-                self.delete_photo()
-                return
-            
-            # Navigate
-            if x < self.width // 3:
-                self.gallery_index = (self.gallery_index - 1) % len(self.photos) if self.photos else 0
-            elif x > self.width * 2 // 3:
-                self.gallery_index = (self.gallery_index + 1) % len(self.photos) if self.photos else 0
+        img = self.image_rect
+        if img.collidepoint(x, y) and not (self._toolbar_floating and tb["bar"].collidepoint(x, y)):
+            # Magnify around the tapped point (or move the magnified window there)
+            self._zoom_at((x - img.x) / img.w, (y - img.y) / img.h)
+
+    def _touch_gallery(self, pos):
+        x, y = pos
+        # Back Button
+        if self.back_btn_rect.inflate(20, 20).collidepoint(pos):
+            self.mode = "camera"
+            self._last_presented = None
+            return
+        # Trash Button
+        if self.photos and self.trash_btn_rect.inflate(20, 20).collidepoint(pos):
+            name = self.photos[self.gallery_index].name
+            self._ask("Eliminare la foto?", f"{name} verrà cancellata dalla scheda.",
+                      "trash", DANGER, "Elimina", self._confirm_delete)
+            return
+        # Navigate
+        if not self.photos:
+            return
+        if x < self.width // 3:
+            self.gallery_index = (self.gallery_index - 1) % len(self.photos)
+        elif x > self.width * 2 // 3:
+            self.gallery_index = (self.gallery_index + 1) % len(self.photos)
+
+    def _process_input(self):
+        # Process touch queue from evdev
+        try:
+            while True:
+                event_type, x, y = self.touch_queue.get_nowait()
+                if event_type == 'click':
+                    self._on_tap((x, y))
+        except queue.Empty:
+            pass
+
+        # Events (fallback se evdev non disponibile)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.running = False
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                # Use mouse events always
+                print(f"DEBUG MOUSE: pos={event.pos}")
+                self._on_tap(event.pos)
+
+    # ---------------- main loop ----------------
+
+    def _compose(self):
+        """The next frame to show (already rotated for the panel)."""
+        if self.overlay is not None:
+            if self.mode == "camera":
+                self._feed_remote_only()
+            return self._overlay_surface()
+        if self.mode == "gallery":
+            return self._gallery_surface()
+        self.update_preview()
+        return pygame.transform.rotate(self.draw_camera_ui(), 180)
 
     def run(self):
         """Main loop"""
@@ -2605,74 +3897,46 @@ class CameraApp:
 
         try:
             while self.running:
-                # Capture pending
+                # Shutter button: wakes the camera when it is asleep
                 if self.capture_pending:
-                    self.capture_photo()
                     self.capture_pending = False
-                
-                # Process touch queue from evdev
-                try:
-                    while True:
-                        event_data = self.touch_queue.get_nowait()
-                        event_type, x, y = event_data
-                        if event_type == 'click':
-                            # Wake from standby on any touch
-                            if self.standby_mode:
-                                self.wake_from_standby()
-                            # Restore screen if off
-                            elif self.saved_brightness == "software_black":
-                                self.saved_brightness = None
-                            else:
-                                self.handle_touch((x, y))
-                except queue.Empty:
-                    pass
-                
+                    if self.standby_mode:
+                        self.wake_from_standby()
+                    elif self.overlay != "shutdown":
+                        self.capture_photo()
+
+                self._process_input()
+                if self._overlay_request:
+                    if self.overlay in ("wifi", "password"):
+                        self._open_overlay(self._overlay_request)
+                    self._overlay_request = None
+
                 # Process UDP commands
                 self.udp_check()
-                
+
                 # Update Battery every 30 seconds
                 current_time = time.monotonic()
                 if self.battery and current_time - self.last_battery_update > 30:
                     self.battery.update()
                     self.last_battery_update = current_time
-                
-                # Events (fallback se evdev non disponibile)
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        self.running = False
-                    elif event.type == pygame.KEYDOWN:
-                        if event.key == pygame.K_ESCAPE:
-                            self.running = False
-                    elif event.type == pygame.MOUSEBUTTONDOWN:
-                        # Use mouse events always
-                        print(f"DEBUG MOUSE: pos={event.pos}")
-                        # Wake from standby on any touch
-                        if self.standby_mode:
-                            self.wake_from_standby()
-                        elif self.saved_brightness == "software_black":
-                            self.saved_brightness = None
-                        else:
-                            self.handle_touch(event.pos)
-                
-                # Screen off mode or standby
-                if self.saved_brightness == "software_black" or self.standby_mode:
-                    self.screen.fill(BLACK)
-                    # In standby, skip preview update to save power
-                    if not self.standby_mode:
-                        self.update_preview()
-                else:
-                    # Sync remote status timeout
-                    if time.monotonic() - self.remote_last_heartbeat > 10:
-                        self.remote_active = False
-                        
-                    # Update preview
-                    if self.mode == "camera":
-                        self.update_preview()
-                        self.draw_camera_ui()
-                    elif self.mode == "gallery":
-                        self.draw_gallery_ui()
-                
-                self._present()
+
+                # Sync remote status timeout
+                if self.remote_active and current_time - self.remote_last_heartbeat > REMOTE_TIMEOUT:
+                    self.remote_active = False
+                    print("Remote disconnected")
+
+                # Standby: nothing to draw (the output is off); poll input at 10 Hz
+                if self.standby_mode:
+                    if current_time - self._last_status_write > 1.0:
+                        self._write_status()
+                    clock.tick(10)
+                    continue
+
+                frame = self._compose()
+                # Menus and the gallery return the same surface while nothing
+                # changes; the framebuffer already shows it.
+                if frame is not self._last_presented:
+                    self._present(frame)
 
                 if not self._first_frame.is_set() and self.current_preview_surface is not None:
                     self._first_frame.set()
@@ -2681,15 +3945,33 @@ class CameraApp:
                     print(f"✓ First frame on screen {time.monotonic() - _T0:.2f}s "
                           f"after start, {_uptime():.1f}s after kernel start")
 
-                clock.tick(30)
-                
+                if current_time - self._last_status_write > STATUS_INTERVAL:
+                    self._write_status()
+
+                # In the viewfinder the camera paces the loop (capture_request
+                # waits for the next frame). A 30 fps tick on top of that
+                # sometimes slept past a frame's arrival, and the loop then
+                # waited for the following one: skipped frames, extra lag.
+                if self.overlay is not None or self.mode != "camera" or self.camera_stalled_since is not None:
+                    clock.tick(30)
+
         finally:
             self.cleanup()
-    
+
     def cleanup(self):
         """Cleanup"""
+        if getattr(self, "_cleaned_up", False):
+            return
+        self._cleaned_up = True
         print("Shutting down...")
-        self._meta_thread_running = False  # stop async metadata thread
+        self.running = False
+        if self.standby_mode:
+            # Do not leave the panel dark and the CPU slowed down for the next start
+            _write_sysfs(self._standby_restore)
+            self._set_display_power(True)
+        for worker in (self.peaker, self.remote_writer):
+            if worker is not None:
+                worker.stop()
         if self.camera is not None:
             try:
                 # Pending requests would make stop() wait on a stalled sensor.
@@ -2705,6 +3987,10 @@ class CameraApp:
 def main():
     """Entry point"""
     app = None
+    # systemctl stop/restart sends SIGTERM, which would otherwise end the
+    # process without cleanup(): the camera left running, and after standby
+    # the display left off.
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
     try:
         app = CameraApp()
         app.run()
