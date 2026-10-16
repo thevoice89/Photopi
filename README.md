@@ -378,6 +378,36 @@ self.picam2.configure(self.picam2.create_preview_configuration(
    sudo journalctl -u camera-ui -n 50
    ```
 
+### "Fotocamera non rilevata" on the Screen
+
+With no camera connected, or a loose flat cable, the app no longer exits. It
+used to: systemd started it again every ~17 s, a boot loop with a flickering
+splash and no way to reach the menu. Now the interface stays up with an error
+card. The settings menu (Wi-Fi, hotspot, web server, standby, reboot,
+shutdown), the gallery and the web pages keep working; whatever needs a camera
+(shutter, ISO, B/W, PEAK, the shutter button, the remote's commands) is dimmed
+and ignored, and the web remote shows the same message.
+
+- **Fotocamera non rilevata**: no sensor is registered. Power the Pi off,
+  reseat the camera's flat cable at both ends, power on.
+- **Fotocamera non avviata**: the sensor is registered but did not start.
+  Reboot from the menu.
+
+The app looks for a sensor every 3 s and starts over by itself if one shows
+up (libcamera only sees sensors that exist when it starts), at most twice per
+boot, so a camera that is registered but will not start cannot cause a loop.
+
+```bash
+journalctl -u camera-ui -b | grep -E "No camera|registered"
+```
+
+Without a camera the firmware says so too (`camera_auto_detect` found nothing
+at boot):
+
+```bash
+vcgencmd get_camera
+```
+
 ### "Fotocamera non risponde" on the Viewfinder
 
 The sensor has stopped sending frames. The journal shows `Camera frontend has
@@ -809,8 +839,19 @@ figures stay under the 33.3 ms budget for the app's 30 fps target.
   it), tried sleep states the kernel does not have, and wrote GPIO/LED paths
   that no longer exist on kernel 6.12. Now: HDMI output off through KMS,
   sensor stopped, `powersave` governor, slow LED blink; everything is put back
-  on wake, at the next start if the app was killed in standby, and on
-  `systemctl stop` (SIGTERM now runs the cleanup).
+  on wake, on `systemctl stop` (SIGTERM now runs the cleanup) and, if the app
+  was killed or crashed while asleep, at the next start (the values to restore
+  are kept in `/tmp/camera_standby.json`, which survives an app restart but not
+  a reboot). It also works without a camera.
+- **No camera** — `run()` used to `return` when the camera could not be
+  opened; the process ended and systemd (`Restart=always`) started it again
+  ~17 s later, forever. Now the interface stays up with an error card
+  ("non rilevata": no sensor registered; "non avviata": registered but did not
+  start), controls that need a camera are dimmed and ignored, the web pages
+  show the same state. The screen is re-rendered only when something on it
+  changes. Every 3 s the app checks whether a sensor appeared and, if so,
+  starts over with `exec` (libcamera enumerates cameras once per process), at
+  most twice per boot.
 - **Display mode** — 720x480 instead of 640x480 on the MPI3508, whose
   480x320 panel is 3:2 (see Troubleshooting). The viewfinder grew from
   354x236 to 353x265 panel pixels with the right proportions.

@@ -213,6 +213,18 @@ HOTSPOT_IP = "10.42.0.1"
 # slowly so the camera does not look switched off.
 CPUFREQ_GOVERNOR = "/sys/devices/system/cpu/cpufreq/policy0/scaling_governor"
 ACT_LED = "/sys/class/leds/ACT"
+# What the app records while asleep, so that a run that dies in standby (killed,
+# crashed) can be undone by the next one. A file in /tmp: it survives an app
+# restart, not a reboot.
+STANDBY_STATE = "/tmp/camera_standby.json"
+# Without a camera the interface stays up and says so. Every CAMERA_RECHECK
+# seconds the app looks for one; libcamera only sees a sensor that exists when
+# its first Picamera2() is created, so when one shows up the app starts over
+# (at most MAX_RELAUNCH times per boot: a camera that is registered but will
+# not start must not make a loop; the count is cleared once a camera starts).
+CAMERA_RECHECK = 3.0
+RELAUNCH_FILE = "/tmp/camera_relaunch"
+MAX_RELAUNCH = 2
 
 # Display output (see FramebufferOutput). CAMERA_DISPLAY=sdl forces the old
 # SDL/KMSDRM path.
@@ -311,6 +323,9 @@ PEAK_NOISE_FACTOR = 4.0
 # The peaking filter runs on its own core at up to this rate; the viewfinder
 # paints the latest result on every frame.
 PEAK_INTERVAL = 1 / 15
+# Remote commands that need a camera (ignored while there is none)
+CAMERA_COMMANDS = frozenset(("CAPTURE", "ISO_UP", "ISO_DOWN", "ISO", "SHUTTER_UP", "SHUTTER_DOWN",
+                             "SHUTTER", "BW", "PEAK", "ZOOM", "ZOOM_AT"))
 
 
 class FramebufferOutput:
@@ -1070,6 +1085,12 @@ def _draw_icon_shape(surf, name, s, color, level=4):
         pygame.draw.rect(surf, color, body, int(w), border_radius=int(s * .1))
         pygame.draw.rect(surf, color, (s * .36, s * .2, s * .28, s * .12), border_radius=int(s * .04))
         pygame.draw.circle(surf, color, (c, s * .56), s * .14, int(w))
+    elif name == "camera_off":
+        body = pygame.Rect(s * .12, s * .3, s * .76, s * .52)
+        pygame.draw.rect(surf, color, body, int(w), border_radius=int(s * .1))
+        pygame.draw.rect(surf, color, (s * .36, s * .2, s * .28, s * .12), border_radius=int(s * .04))
+        pygame.draw.circle(surf, color, (c, s * .56), s * .14, int(w))
+        _stroke(surf, color, [(s * .16, s * .14), (s * .84, s * .88)], w * 1.2)
 
 
 class CameraApp:
@@ -1096,6 +1117,11 @@ class CameraApp:
         self.camera_stalled_since = None
         self._last_camera_restart = 0.0
         self._first_frame = threading.Event()
+        # No camera at start-up: the interface stays up and says so (see run())
+        self.camera_absent = False         # no sensor is registered at all
+        self._last_camera_check = 0.0
+        self.relaunch = False              # a camera showed up late: main() starts over
+        self._nocam_frame = None           # (signature, rotated surface)
         threading.Thread(target=self._init_camera, daemon=True).start()
 
         print("Initializing display...")
@@ -1108,10 +1134,7 @@ class CameraApp:
             self.fb = FramebufferOutput.open(FBDEV_PATH, FBDEV_WAIT)
         if self.fb is not None:
             os.environ["SDL_VIDEODRIVER"] = "dummy"
-            # A previous run killed in standby leaves the output powered down
-            # (reading sysfs costs nothing; sudo runs only in that case).
-            if any(_read_sysfs(p) == "Off" for p in glob.glob("/sys/class/drm/card*-HDMI-*/dpms")):
-                self._set_display_power(True)
+            self._recover_from_standby()
 
         # Only the subsystems actually used.  pygame.init() would also spin up
         # mixer/joystick, which cost time and are never touched here.
@@ -1283,6 +1306,7 @@ class CameraApp:
         self._label_cache = {}
         self._text_cache = {}
         self._icon_cache = {}
+        self._dim_cache = {}
         self._qr_cache = {}
         self._toolbar_cache = {}
 
@@ -1424,7 +1448,8 @@ class CameraApp:
         # frame, for the SD card and the GIL. The second wait is bounded so a
         # camera that never delivers a frame does not leave touch dead.
         self._camera_ready.wait(timeout=CAMERA_INIT_TIMEOUT + 50)
-        self._first_frame.wait(timeout=3.0)
+        if self.camera is not None:
+            self._first_frame.wait(timeout=3.0)
 
         # The service now starts while udev may still be loading drivers and
         # assigning device groups, so a device missing on the first look is
@@ -1590,6 +1615,8 @@ class CameraApp:
             self.remote_last_heartbeat = now
             return
         print(f"UDP Command: {cmd}")
+        if self.camera is None and name in CAMERA_COMMANDS:
+            return
         if name == "STOP_REMOTE":
             self.remote_active = False
         elif name == "WAKE":
@@ -1635,6 +1662,8 @@ class CameraApp:
     def _status_snapshot(self):
         if self.standby_mode:
             state = "standby"
+        elif self.camera is None:
+            state = "nocamera"
         elif self.camera_stalled_since is not None:
             state = "stalled"
         else:
@@ -2018,6 +2047,42 @@ class CameraApp:
         writes += [(f"{bl}/bl_power", 0 if on else 4) for bl in glob.glob("/sys/class/backlight/*")]
         _write_sysfs(writes)
 
+    @staticmethod
+    def _save_standby_state(restore):
+        try:
+            with open(STANDBY_STATE, "w") as f:
+                json.dump(restore, f)
+        except OSError as e:
+            print(f"Standby state not saved: {e}")
+
+    @staticmethod
+    def _clear_standby_state():
+        try:
+            os.remove(STANDBY_STATE)
+        except OSError:
+            pass
+
+    def _recover_from_standby(self):
+        """Undo a standby that the previous run did not get to end (killed, crashed).
+
+        It leaves the output powered down, the CPU on the powersave governor
+        and the LED blinking. Cheap to check (a file in /tmp and a sysfs read);
+        sudo runs only when there is something to undo.
+        """
+        restore = None
+        try:
+            with open(STANDBY_STATE) as f:
+                restore = [tuple(item) for item in json.load(f)]
+        except (OSError, ValueError, TypeError):
+            pass
+        dark = any(_read_sysfs(p) == "Off" for p in glob.glob("/sys/class/drm/card*-HDMI-*/dpms"))
+        if restore is None and not dark:
+            return
+        print("The previous run ended in standby: restoring display and CPU")
+        _write_sysfs(restore or [])
+        self._set_display_power(True)
+        self._clear_standby_state()
+
     def enter_standby(self):
         """Display off, sensor stopped, CPU slowed down; network and web server stay up.
 
@@ -2027,18 +2092,19 @@ class CameraApp:
         the camera; the old version stopped the server and never restarted it.
         Wake with a touch, the shutter button or the web remote.
         """
-        if self.standby_mode or self.camera is None:
+        if self.standby_mode:
             return
         print("Entering standby...")
         self._close_overlay()
         self.standby_mode = True
-        try:
-            # Pending requests would make stop() wait for a frame
-            self.camera.cancel_all_and_flush()
-            self.camera.stop()
-            print("✓ Camera stopped")
-        except Exception as e:
-            print(f"Camera stop warning: {e}")
+        if self.camera is not None:
+            try:
+                # Pending requests would make stop() wait for a frame
+                self.camera.cancel_all_and_flush()
+                self.camera.stop()
+                print("✓ Camera stopped")
+            except Exception as e:
+                print(f"Camera stop warning: {e}")
 
         # Black frame first, in case the output cannot be switched off
         self.screen.fill(BLACK)
@@ -2055,6 +2121,8 @@ class CameraApp:
             restore.append((f"{ACT_LED}/trigger", current))
             # The timer trigger creates delay_on/delay_off when it is selected
             writes.append((f"{ACT_LED}/trigger", "timer"))
+        # Written before anything changes, in case this run does not live to wake up
+        self._save_standby_state(restore)
         _write_sysfs(writes)
         if any(path.endswith("trigger") for path, _ in writes):
             _write_sysfs([(f"{ACT_LED}/delay_on", 80), (f"{ACT_LED}/delay_off", 2920)])
@@ -2071,14 +2139,16 @@ class CameraApp:
         # CPU speed first, so the rest runs at full clock
         _write_sysfs(self._standby_restore)
         self._standby_restore = []
+        self._clear_standby_state()
         self._set_display_power(True)
-        try:
-            self._restart_preview()
-            print("✓ Camera restarted")
-        except Exception as e:
-            print(f"Wake error: {e}")
-            # The stall recovery in _capture_preview_frame keeps retrying
-            self.camera_stalled_since = time.monotonic()
+        if self.camera is not None:
+            try:
+                self._restart_preview()
+                print("✓ Camera restarted")
+            except Exception as e:
+                print(f"Wake error: {e}")
+                # The stall recovery in _capture_preview_frame keeps retrying
+                self.camera_stalled_since = time.monotonic()
         self.standby_mode = False
         self._last_presented = None
         self._write_status()
@@ -2156,6 +2226,11 @@ class CameraApp:
         if current_time - self.last_capture_time < BUTTON_DEBOUNCE:
             return
         self.last_capture_time = current_time
+
+        if self.camera is None:
+            print("Capture skipped: no camera")
+            self._show_toast("Fotocamera non rilevata", "danger")
+            return
 
         if self.camera_stalled_since is not None:
             print("Capture skipped: the camera is not delivering frames")
@@ -2446,7 +2521,9 @@ class CameraApp:
         ui_surface.fill(BLACK)
 
         # 1. Preview (sfondo)
-        if self.current_preview_surface:
+        if self.camera is None:
+            self._draw_no_camera(ui_surface)
+        elif self.current_preview_surface:
             ui_surface.blit(self.current_preview_surface, self.preview_rect)
         else:
             pygame.draw.rect(ui_surface, SURFACE_1, self.preview_rect)
@@ -2492,6 +2569,13 @@ class CameraApp:
         self.draw_icon(ui_surface, "bw", self.bw_center, active=self.grayscale_mode)
         self.draw_icon(ui_surface, "fp", self.fp_center, active=self.focus_peaking_mode)
 
+        if self.camera is None:
+            # Everything that needs a camera is dimmed; taps on it are ignored
+            lower_right = pygame.Rect(self.right_bar_rect.x, self.height // 2,
+                                      self.right_bar_rect.w, self.height - self.height // 2)
+            for rect in (self.left_bar_rect, lower_right):
+                ui_surface.blit(self._dim(rect.size), rect.topleft)
+
         # 6. Battery Indicator (Top Right)
         if self.battery and self.battery.available:
             batt_val = int(self.battery.percentage)
@@ -2520,6 +2604,84 @@ class CameraApp:
                 y_offset += 20
 
         return ui_surface
+
+    def _dim(self, size):
+        """Translucent veil over controls that cannot be used (cached per size)."""
+        veil = self._dim_cache.get(size)
+        if veil is None:
+            veil = pygame.Surface(size, pygame.SRCALPHA)
+            veil.fill((*SURFACE_0, 165))
+            self._dim_cache[size] = veil
+        return veil
+
+    def _draw_no_camera(self, surface):
+        """The viewfinder area when there is no camera: what is wrong and what to do."""
+        if self.camera_absent:
+            title = "Fotocamera non rilevata"
+            hint = "Spegni il Pi, ricollega il cavo flat della fotocamera e riaccendi."
+        else:
+            title = "Fotocamera non avviata"
+            hint = "Controlla il cavo flat e riavvia dal menu."
+        note = "Menu, galleria e pagina web restano disponibili."
+        pygame.draw.rect(surface, SURFACE_0, self.preview_rect)
+        cx = self.preview_rect.centerx
+        w = min(self.preview_rect.w - 32, 420)
+        text_w = w - 40
+        hint_lines = len(self._wrap(self.f_caption, hint, text_w))
+        note_lines = len(self._wrap(self.f_caption, note, text_w))
+        card = pygame.Rect(0, 0, w, 24 + 70 + 34 + 20 * hint_lines + 8 + 18 * note_lines + 20)
+        card.center = self.preview_rect.center
+        self.draw_card(surface, card, radius=18, fill=SURFACE_1, border=HAIRLINE)
+        y = card.y + 24
+        self._disc(surface, (cx, y + 28), 30, (*DANGER, 60))
+        self._blit_icon(surface, "camera_off", (cx, y + 28), 32, DANGER)
+        y += 70
+        label = self._text(self.f_heading, title, TEXT_HI)
+        surface.blit(label, label.get_rect(midtop=(cx, y)))
+        y += 34
+        y = self._blit_lines(surface, self.f_caption, hint, TEXT_MID, (cx, y), text_w,
+                             line_h=20, center=True)
+        self._blit_lines(surface, self.f_caption, note, TEXT_LOW, (cx, y + 8), text_w,
+                         line_h=18, center=True)
+
+    def _no_camera_surface(self):
+        """Camera screen without a camera: re-rendered only when something on it changes."""
+        toast = self._active_toast()
+        battery = int(self.battery.percentage) if self.battery and self.battery.available else None
+        sig = (toast[:2] if toast else None, battery, self.remote_active, self.camera_absent)
+        if self._nocam_frame is None or self._nocam_frame[0] != sig:
+            self._nocam_frame = (sig, pygame.transform.rotate(self.draw_camera_ui(), 180))
+        return self._nocam_frame[1]
+
+    def _check_camera_appeared(self, now):
+        """Without a camera: look for one every few seconds, and start over when it shows up."""
+        if now - self._last_camera_check < CAMERA_RECHECK:
+            return
+        self._last_camera_check = now
+        ready = _camera_devices_ready()
+        self.camera_absent = not ready
+        # Not while a menu or the gallery is open: starting over closes them
+        if not ready or self.overlay is not None or self.mode != "camera":
+            return
+        attempts = self._relaunch_count()
+        if attempts >= MAX_RELAUNCH:
+            return  # registered but it will not start: the screen says so
+        try:
+            with open(RELAUNCH_FILE, "w") as f:
+                f.write(str(attempts + 1))
+        except OSError:
+            return
+        print(f"✓ A camera is registered: starting over to pick it up ({attempts + 1}/{MAX_RELAUNCH})")
+        self.relaunch = True
+        self.running = False
+
+    @staticmethod
+    def _relaunch_count():
+        try:
+            with open(RELAUNCH_FILE) as f:
+                return int(f.read())
+        except (OSError, ValueError):
+            return 0
 
     def _draw_stall_warning(self, surface):
         """Card over the preview while the sensor is not delivering frames."""
@@ -3760,6 +3922,9 @@ class CameraApp:
 
     def _touch_camera(self, pos):
         x, y = pos
+        if self.camera is None and not (self.power_rect.collidepoint(x, y)
+                                        or self.gallery_rect.collidepoint(x, y)):
+            return  # nothing but the menu and the gallery works without a camera
         # Left Sidebar Interaction
         if x < self.sidebar_width:
             # SHUTTER (Top)
@@ -3875,6 +4040,8 @@ class CameraApp:
             return self._overlay_surface()
         if self.mode == "gallery":
             return self._gallery_surface()
+        if self.camera is None:
+            return self._no_camera_surface()
         self.update_preview()
         return pygame.transform.rotate(self.draw_camera_ui(), 180)
 
@@ -3890,10 +4057,20 @@ class CameraApp:
         if not self._camera_ready.wait(timeout=CAMERA_INIT_TIMEOUT + 50):
             print("Camera did not become ready in time")
         if self.camera is None:
-            self._draw_splash("Fotocamera non disponibile")
-            print(f"Fatal: camera unavailable ({self.camera_error})")
-            return
-        print(f"✓ Ready in {time.monotonic() - _T0:.2f}s")
+            # Not fatal. Returning here ended the process and systemd started it
+            # again every ~17 s: a boot loop. The interface stays up instead and
+            # says what is wrong; the menu, the gallery and the web page work,
+            # and _check_camera_appeared() starts over if a camera shows up.
+            self.camera_absent = not _camera_devices_ready()
+            print(f"⚠ No camera ({self.camera_error}): "
+                  f"{'no sensor is registered' if self.camera_absent else 'it did not start'}; "
+                  "the interface stays up")
+        else:
+            print(f"✓ Ready in {time.monotonic() - _T0:.2f}s")
+            try:
+                os.remove(RELAUNCH_FILE)
+            except OSError:
+                pass
 
         try:
             while self.running:
@@ -3932,6 +4109,11 @@ class CameraApp:
                     clock.tick(10)
                     continue
 
+                if self.camera is None:
+                    self._check_camera_appeared(current_time)
+                    if not self.running:
+                        continue
+
                 frame = self._compose()
                 # Menus and the gallery return the same surface while nothing
                 # changes; the framebuffer already shows it.
@@ -3952,7 +4134,8 @@ class CameraApp:
                 # waits for the next frame). A 30 fps tick on top of that
                 # sometimes slept past a frame's arrival, and the loop then
                 # waited for the following one: skipped frames, extra lag.
-                if self.overlay is not None or self.mode != "camera" or self.camera_stalled_since is not None:
+                if (self.overlay is not None or self.mode != "camera" or self.camera is None
+                        or self.camera_stalled_since is not None):
                     clock.tick(30)
 
         finally:
@@ -3968,6 +4151,7 @@ class CameraApp:
         if self.standby_mode:
             # Do not leave the panel dark and the CPU slowed down for the next start
             _write_sysfs(self._standby_restore)
+            self._clear_standby_state()
             self._set_display_power(True)
         for worker in (self.peaker, self.remote_writer):
             if worker is not None:
@@ -4004,6 +4188,13 @@ def main():
     finally:
         if app:
             app.cleanup()
+    if app is not None and app.relaunch:
+        print("Starting over")
+        try:
+            # Same command line as this process (python3 -c "..." under systemd)
+            os.execv(sys.executable, [sys.executable] + sys.orig_argv[1:])
+        except OSError as e:
+            print(f"Restart failed ({e}); the service manager will start the app again")
 
 
 if __name__ == "__main__":

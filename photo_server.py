@@ -942,6 +942,7 @@ function describe(s) {
   const batt = s.battery != null ? ` · ${s.battery}%` : '';
   if (s.status === 'standby') return ['warn', 'In standby', 'Schermo e sensore spenti' + batt];
   if (s.status === 'stalled') return ['warn', 'Il sensore non risponde', 'Controlla il cavo flat' + batt];
+  if (s.status === 'nocamera') return ['warn', 'Fotocamera non rilevata', 'Spegni, ricollega il cavo flat e riaccendi' + batt];
   return ['ok', s.mode === 'remote' ? 'Pronta · telecomando aperto' : 'Pronta', settings + batt];
 }
 async function poll() {
@@ -1155,6 +1156,7 @@ function setState(kind) {
     offline: ['camera', 'Fotocamera non raggiungibile', "L'app sul display non risponde. Riprovo…", null],
     standby: ['moon', 'Fotocamera in standby', 'Schermo e sensore sono spenti.', 'Risveglia'],
     stalled: ['camera', 'Il sensore non invia immagini', 'Controlla il cavo flat. La fotocamera riprova da sola.', null],
+    nocamera: ['camera', 'Fotocamera non rilevata', 'Spegni, ricollega il cavo flat della fotocamera e riaccendi. Galleria e menu funzionano.', null],
   }[kind];
   $('state-ic').innerHTML = icon(map[0]);
   $('state-title').textContent = map[1];
@@ -1170,7 +1172,8 @@ function update(s) {
   const online = s.online, sleeping = s.status === 'standby';
   $('live-dot').className = 'dot ' + (online && !sleeping ? 'live' : online ? 'warn' : 'off');
   $('live-txt').textContent = !online ? 'Offline' : sleeping ? 'Standby' : 'Live';
-  setState(!online ? 'offline' : sleeping ? 'standby' : s.status === 'stalled' ? 'stalled' : null);
+  setState(!online ? 'offline' : sleeping ? 'standby' : s.status === 'stalled' ? 'stalled'
+           : s.status === 'nocamera' ? 'nocamera' : null);
   if (!online) return;
   // Pickers (skip while a tap is in flight, so they do not jump back)
   if (!pending || Date.now() - pending > 1200) {
@@ -1206,7 +1209,7 @@ function update(s) {
   }
   const sh = $('shutter');
   sh.classList.toggle('busy', !!s.capturing || shutterWait);
-  sh.disabled = sleeping;
+  sh.disabled = sleeping || s.status === 'nocamera';
   built = true;
 }
 
